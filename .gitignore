@@ -1,0 +1,12 @@
+# Build output
+/dnsscan-linux-amd64
+/dnsscan-linux-arm64
+/dnsscan
+/dist/
+/.build/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
