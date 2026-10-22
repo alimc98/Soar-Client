@@ -15,10 +15,11 @@ resolvers that actually carry a tunnel, and start with that list.
 > The old repository only contained the standalone scanner; this repository is
 > the combined client + scanner.
 
-> **Status:** client `1.1.0` adds authenticated public SOCKS listeners. The
-> tunnel and scanner paths were validated on 2026-10-22 on AlmaLinux 8.10
-> against a live Soar `0.5.0` server; manual and auto modes authenticated and
-> carried real HTTPS traffic through the tunnel.
+> **Status:** client `1.2.0` adds listener/credential environment overrides and
+> a per-instance systemd template for multiple SOCKS endpoints. The tunnel and
+> scanner paths were validated on 2026-10-22 on AlmaLinux 8.10 against a live
+> Soar `0.5.0` server; manual and auto modes authenticated and carried real
+> HTTPS traffic through the tunnel.
 
 ## What is inside
 
@@ -60,7 +61,7 @@ bundled country/global fallback.
 Go 1.25 or newer is required.
 
 ```bash
-./build.sh 1.0.0
+./build.sh 1.2.0
 ```
 
 Output:
@@ -79,8 +80,8 @@ sudo bash install.sh
 or, from a release tarball:
 
 ```bash
-tar -xzf soar-client-1.0.0-linux-amd64.tar.gz
-cd soar-client-1.0.0-linux-amd64
+tar -xzf soar-client-1.2.0-linux-amd64.tar.gz
+cd soar-client-1.2.0-linux-amd64
 sudo bash install.sh
 ```
 
@@ -90,11 +91,14 @@ The installer creates:
 |---|---|
 | `/usr/local/bin/soar-client` | client + scanner binary |
 | `/usr/local/bin/soar-client-run` | reads `/etc/soar-client/mode.env` and starts the client |
+| `/usr/local/bin/soar-client-instance` | wrapper for `soar-client@.service` instances |
 | `/etc/soar-client/client.json` | Soar zone, public key, listen address, advanced options |
 | `/etc/soar-client/resolvers.txt` | manual resolver list |
 | `/etc/soar-client/candidates.txt` | bundled Iranian CIDR list for auto mode |
-| `/etc/soar-client/mode.env` | selects manual or auto mode for systemd |
-| `/etc/systemd/system/soar-client.service` | systemd unit |
+| `/etc/soar-client/mode.env` | selects manual or auto mode for the main service |
+| `/etc/soar-client/instances/` | one `NAME.env` file per extra instance |
+| `/etc/systemd/system/soar-client.service` | main systemd unit |
+| `/etc/systemd/system/soar-client@.service` | per-instance systemd template |
 | `/var/lib/soar-client/` | scan reports and generated resolver lists |
 
 Edit `/etc/soar-client/client.json` and set `zone` and `server_public_key` from
@@ -136,7 +140,149 @@ SOCKS5 username/password is not encrypted on the client-to-listener hop. If the
 port is reachable over an untrusted network, restrict it with a firewall
 allow-list, a VPN, or an SSH tunnel.
 
-### 3. Manual mode
+### 3. Change the SOCKS port, username, or password
+
+The values in `client.json` are defaults. You can override the listener and
+credentials without duplicating the tunnel configuration. Precedence is:
+
+```
+client.json  <  SOAR_* environment  <  command-line flags
+```
+
+| Override | Environment | Flag |
+|---|---|---|
+| Listen address | `SOAR_LISTEN` | `-listen` |
+| SOCKS username | `SOAR_USERNAME` | `-username` |
+| SOCKS password | `SOAR_PASSWORD` | `-password` |
+
+Example with environment variables:
+
+```bash
+SOAR_LISTEN=0.0.0.0:10887 \
+SOAR_USERNAME=soar2 \
+SOAR_PASSWORD='use-a-long-random-password' \
+soar-client run -config /etc/soar-client/client.json \
+  -mode manual -resolvers /etc/soar-client/resolvers.txt
+```
+
+For the main systemd service, put the same assignments in
+`/etc/soar-client/mode.env`, then restart:
+
+```bash
+# /etc/soar-client/mode.env
+SOAR_LISTEN=0.0.0.0:10887
+SOAR_USERNAME=soar2
+SOAR_PASSWORD=use-a-long-random-password
+```
+
+```bash
+systemctl restart soar-client
+```
+
+The flag form is convenient for a one-off test:
+
+```bash
+soar-client run -config /etc/soar-client/client.json \
+  -mode manual -resolvers /etc/soar-client/resolvers.txt \
+  -listen 0.0.0.0:10887 -username soar2 -password 'use-a-long-random-password'
+```
+
+> `-password` and `-username` appear in the process list. Prefer the config file
+> or `SOAR_*` environment variables for a long-running service. Setting
+> `SOAR_USERNAME=` and `SOAR_PASSWORD=` to empty clears the credentials; a
+> non-loopback listener will then be rejected by validation.
+
+### 4. Run multiple SOCKS endpoints
+
+A single client process has **one DNS tunnel and one listener**. Starting five
+processes gives five independent tunnels. Five ports on one process would share
+one tunnel and would not add bandwidth. For five independent tunnels, run five
+processes (or five systemd instances), each with its own listener and tunnel
+session.
+
+The release includes `soar-client@.service`, a systemd template that reads
+`/etc/soar-client/instances/%i.env` and starts
+`/usr/local/bin/soar-client-instance`.
+
+Example: five instances on `127.0.0.1:10886`–`10890` (replace the main service,
+or use `10887`–`10891` alongside it):
+
+```bash
+sudo install -d -m 0750 -o root -g soar-client /etc/soar-client/instances
+
+for i in 1 2 3 4 5; do
+  sudo cp /etc/soar-client/instances/example.env \
+    "/etc/soar-client/instances/$i.env"
+  sudo chmod 600 "/etc/soar-client/instances/$i.env"
+done
+```
+
+Edit each file. A minimal `1.env`:
+
+```bash
+SOAR_LISTEN=127.0.0.1:10886
+SOAR_USERNAME=soar1
+SOAR_PASSWORD=replace-with-a-long-random-password
+
+# Optional: a different resolver path for this tunnel.
+SOAR_ARGS="-mode manual -resolvers /etc/soar-client/instances/1.resolvers"
+```
+
+Then enable the instances:
+
+```bash
+sudo systemctl enable --now soar-client@{1..5}
+systemctl status 'soar-client@*' --no-pager
+ss -ltnp | grep -E ':1088[6-9]|:10890'
+```
+
+If you already run `soar-client.service` on `10886`, disable it first or start
+the instances on different ports:
+
+```bash
+sudo systemctl disable --now soar-client
+```
+
+If the bonding core runs on another machine, do **not** expose five
+unauthenticated public ports. Use a WireGuard/SSH tunnel, or bind to loopback
+and forward securely. If a public bind is unavoidable, use a distinct strong
+password per instance and restrict the ports with a firewall.
+
+#### Does running five clients make one connection faster?
+
+| Goal | Result |
+|---|---|
+| More total throughput for many parallel connections | Yes, if the core distributes new TCP connections across healthy tunnels |
+| Faster single TCP download / single HTTP stream | No, not with only SOCKS endpoints; that stream stays on one tunnel |
+| Survive one tunnel or resolver path failing | Yes, with health checks and failover in the core |
+| Aggregate a single stream across all five tunnels | Only with MPTCP or an application-level split plus a remote reassembly agent |
+
+Each process is a separate Soar session with its own `maxStreams` and
+`maxInflight` limits. However, if all five use the **same zone/public key**
+(one panel account), the account's quota and rate limits, and any panel-side
+aggregate stream cap, apply to the account as a whole; five processes cannot
+create capacity the account does not have. Different accounts and, more
+importantly, different resolver paths give the aggregation something real to
+use. If all five use the same six resolvers, they contend for the same DNS
+path.
+
+For a bonding core:
+
+- Balance **new TCP connections** (round-robin or least-connections), not
+  individual packets of one TCP connection. Packet-level round-robin over five
+  SOCKS tunnels causes reordering and will collapse TCP throughput.
+- A browser may multiplex many HTTP/2 requests over one TCP connection; that
+  connection is still pinned to one tunnel. Per-flow balancing helps page loads
+  only when the client opens multiple connections.
+- For a single large download, use multiple HTTP range connections (if the
+  server supports ranges) or a transport with real multipath support. A
+  transparent single-stream bond requires a remote agent that terminates the
+  stream, splits it, and reassembles it; five ordinary SOCKS proxies are not
+  enough.
+- Use `manual` mode for the five instances. Running `auto` five times scans the
+  same candidate ranges five times and increases DNS load and startup time.
+
+### 5. Manual mode
 
 Put your working resolvers in `/etc/soar-client/resolvers.txt`:
 
@@ -160,7 +306,7 @@ does not add a verification delay. Use `-verify=on` if you want every entry
 checked with a real Soar handshake before the SOCKS listener is opened, or
 `-verify=off` to make the fast path explicit.
 
-### 4. Auto mode
+### 6. Auto mode
 
 ```bash
 soar-client run -config /etc/soar-client/client.json \
@@ -182,7 +328,7 @@ What happens:
 The default embedded candidate list is the Iranian CIDR snapshot in
 `data/resolver-candidates.txt`. `-candidates embedded` selects it explicitly.
 
-### 5. Scan only
+### 7. Scan only
 
 ```bash
 soar-client scan \
@@ -245,6 +391,8 @@ point this at a zone you control.
 | `-scan` | off | shorthand for `-mode auto` |
 | `-scan-only` | off | shorthand for `-mode scan` |
 | `-listen ADDR` | from config | override the SOCKS listener (public binds need auth) |
+| `-username USER` | from config | override the SOCKS username (visible in `ps`) |
+| `-password PASS` | from config | override the SOCKS password (visible in `ps`) |
 | `-discovery on\|off` | off in manual/auto | add bundled Soar discovery fallback |
 | `-verify` | `auto` | `auto` = on for auto/scan, off for manual; or `on` / `off` |
 | `-verify-workers N` | `2` | concurrent verification probes |
@@ -257,10 +405,39 @@ The legacy form still works:
 soar-client -config client.json -resolvers resolvers.txt
 ```
 
+## Soar vs CottenDNS
+
+The panel can show two share profiles for the same panel account: **Soar** and
+**CottenDNS**. They are separate tunnel engines, not two modes of this binary:
+
+| Profile | Engine | Client |
+|---|---|---|
+| Soar | `getlantern/soar` with WhiteDNS transport fixes | this `soar-client` binary |
+| CottenDNS | `cottendns-go` | the official CottenDNS client |
+
+This binary is Soar-only. It imports `github.com/getlantern/soar`, reads
+`zone`, `server_public_key`, and the `soar` options, and has no CottenDNS code.
+A CottenDNS profile cannot be loaded with `-config`, and there is no
+`-engine cotten` switch in `1.2.0`.
+
+If the panel account is set to **Soar + Cotten**, both profiles are valid on
+the server. To use CottenDNS from Iran, run the official
+[CottenDNS client](https://github.com/WhiteDNS/CottenDNS) on a separate SOCKS
+port and give the bonding core both endpoints; the server side is already
+provisioned. The official client has its own TOML configuration, domains, and
+encryption key, so its profile is not interchangeable with the Soar
+`client.json`.
+
+Adding a native CottenDNS mode to this binary would mean vendoring or embedding
+the CottenDNS engine and merging its configuration/listener model. That is a
+separate engine integration, not a configuration toggle; it is not part of
+`1.2.0`.
+
 ## systemd mode selection
 
 The unit starts `/usr/local/bin/soar-client-run`, which sources
-`/etc/soar-client/mode.env`. To switch modes, edit that file and restart:
+`/etc/soar-client/mode.env` and exports its variables. To switch modes or
+override the listener/credentials, edit that file and restart:
 
 ```bash
 # manual
@@ -312,6 +489,12 @@ line and is what manual mode and the service consume.
   443). Change it in the panel, not in the client.
 - The private key never leaves the server. The client only has the public key.
 - `/etc/soar-client/client.json` is mode `0640` and owned by `root:soar-client`.
+- Per-instance files under `/etc/soar-client/instances/` contain passwords; use
+  mode `0600` and `root:root` ownership. The systemd template reads them as
+  root, so the service user does not need read access.
+- Environment overrides (`SOAR_PASSWORD`, etc.) are safer than command-line
+  flags, but any user who can read the service environment or the env file can
+  read the password. Restrict both.
 - Scan reports can reveal network topology; keep `/var/lib/soar-client` private.
 
 ## Troubleshooting
@@ -330,7 +513,7 @@ line and is what manual mode and the service consume.
 
 ```bash
 go test ./...
-./build.sh 1.0.0
+./build.sh 1.2.0
 ```
 
 The test suite covers the Soar config bounds, SOCKS negotiation, hostname
@@ -349,7 +532,7 @@ clones keep working. If an existing clone still uses the old URL, update it:
 git remote set-url origin https://github.com/alimc98/Soar-Client.git
 ```
 
-Release tag: `soar-client-v1.1.0`.
+Release tag: `soar-client-v1.2.0`.
 
 ## Credits
 
@@ -406,3 +589,90 @@ systemctl restart soar-client
 ```
 
 برای انتخاب حالت manual/auto، فایل `/etc/soar-client/mode.env` را ویرایش کنید.
+
+### تغییر پورت، یوزر و پسورد
+
+مقادیر داخل `client.json` پیش‌فرض هستند و می‌توان بدون دست‌زدن به بقیهٔ کانفیگ
+آن‌ها را override کرد. اولویت این است:
+
+```
+client.json  <  متغیرهای SOAR_*  <  فلگ‌های خط فرمان
+```
+
+```bash
+SOAR_LISTEN=0.0.0.0:10887 \
+SOAR_USERNAME=soar2 \
+SOAR_PASSWORD='یک-رمز-تصادفی-طولانی' \
+soar-client run -config /etc/soar-client/client.json \
+  -mode manual -resolvers /etc/soar-client/resolvers.txt
+```
+
+برای سرویس اصلی، همین سه متغیر را در `/etc/soar-client/mode.env` بگذارید و
+`systemctl restart soar-client` بزنید. فلگ‌های `-listen`، `-username` و
+`-password` هم هستند، ولی پسورد در `ps` دیده می‌شود؛ برای سرویس دائمی از
+فایل یا env استفاده کنید. با خالی‌کردن `SOAR_USERNAME` و `SOAR_PASSWORD`
+احراز هویت پاک می‌شود و یک listener عمومی دیگر معتبر نیست.
+
+### چند کلاینت و پنج پورت SOCKS
+
+هر پروسه فقط **یک تونل** دارد. پنج پورت روی یک پروسه، پنج تونل جدا نمی‌سازد و
+bandwidth را جمع نمی‌کند. برای پنج تونل مستقل، پنج instance بسازید:
+
+```bash
+sudo install -d -m 0750 -o root -g soar-client /etc/soar-client/instances
+for i in 1 2 3 4 5; do
+  sudo cp /etc/soar-client/instances/example.env \
+    "/etc/soar-client/instances/$i.env"
+  sudo chmod 600 "/etc/soar-client/instances/$i.env"
+done
+```
+
+در هر فایل، پورت و یوزر/پس مخصوص همان instance را بگذارید:
+
+```bash
+SOAR_LISTEN=127.0.0.1:10886
+SOAR_USERNAME=soar1
+SOAR_PASSWORD=یک-رمز-تصادفی-طولانی
+SOAR_ARGS="-mode manual -resolvers /etc/soar-client/instances/1.resolvers"
+```
+
+بعد:
+
+```bash
+sudo systemctl enable --now soar-client@{1..5}
+systemctl status 'soar-client@*' --no-pager
+```
+
+اگر سرویس اصلی روی `10886` فعال است، یا اول آن را غیرفعال کنید یا پورت
+instanceها را از `10887` شروع کنید. اگر bonding core روی همان سرور است،
+listenerها را روی `127.0.0.1` بگذارید؛ اگر از بیرون استفاده می‌شود،
+WireGuard/SSH tunnel بهتر از بازکردن پنج پورت عمومی است.
+
+### آیا پنج کلاینت سرعت یک کانکشن را زیاد می‌کند؟
+
+- برای **چند کانکشن موازی**، اگر core اتصال‌های جدید TCP را بین تونل‌های سالم
+  پخش کند، مجموع throughput می‌تواند بیشتر شود.
+- برای **یک دانلود/یک استریم TCP**، آن استریم روی یک تونل می‌ماند و پنج کلاینت
+  سرعتش را پنج برابر نمی‌کنند. برای یک استریم باید از MPTCP یا تقسیم
+  application-level به‌همراه agent مقصد استفاده شود؛ round-robin کردن packet
+  روی چند SOCKS باعث reordering و خرابی TCP می‌شود.
+- اگر هر پنج کلاینت همان `zone` و `public key` (یک اکانت پنل) را استفاده کنند،
+  سهمیه/نرخ و هر سقف aggregate سمت پنل مشترک است. برای aggregation واقعی،
+  اکانت‌های جدا و مهم‌تر از آن resolver pathهای متفاوت بدهید. پنج کلاینت با همان
+  شش resolver، سر یک مسیر DNS با هم رقابت می‌کنند.
+- برای پنج instance از حالت `manual` استفاده کنید؛ `auto` پنج بار اسکن می‌کند و
+  بار DNS و زمان startup را زیاد می‌کند.
+
+### Soar یا CottenDNS؟
+
+اکانت پنل می‌تواند هم پروفایل Soar و هم CottenDNS بدهد؛ این دو موتور جدا هستند،
+نه دو حالت همین باینری. کلاینت فعلی فقط Soar را می‌فهمد (`getlantern/soar`،
+`zone`/`server_public_key`/`soar`). پروفایل CottenDNS با `-config` این برنامه
+کار نمی‌کند و در `1.2.0` سوییچ `-engine cotten` وجود ندارد.
+
+اگر اکانت پنل روی «Soar + Cotten» است، سمت سرور هر دو آماده است. برای استفاده از
+CottenDNS در ایران، کلاینت رسمی CottenDNS را روی یک پورت SOCKS دیگر اجرا کنید و
+هر دو پورت را به bonding core بدهید. CottenDNS کانفیگ TOML، domainها و
+encryption key جداگانه دارد. اضافه‌کردن حالت Cotten به این باینری یعنی embed
+کردن موتور `cottendns-go` و ادغام مدل کانفیگ/لیسنر آن؛ یک پروژهٔ جدا است، نه
+یک فلگ ساده.

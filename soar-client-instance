@@ -1,0 +1,11 @@
+#!/bin/sh
+# systemd loads /etc/soar-client/instances/%i.env via EnvironmentFile before
+# starting this wrapper. It can set SOAR_LISTEN, SOAR_USERNAME, SOAR_PASSWORD,
+# SOAR_ARGS and SOAR_CONFIG. The binary applies the first three as overrides.
+set -eu
+
+: "${SOAR_ARGS:--mode manual -resolvers /etc/soar-client/resolvers.txt}"
+: "${SOAR_CONFIG:-/etc/soar-client/client.json}"
+
+# Intentional word splitting: SOAR_ARGS is a list of command-line arguments.
+exec /usr/local/bin/soar-client -config "$SOAR_CONFIG" $SOAR_ARGS

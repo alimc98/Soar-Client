@@ -4,6 +4,7 @@
 *.env text eol=lf
 *.example text eol=lf
 soar-client-run text eol=lf
+soar-client-instance text eol=lf
 
 # Go source and text data.
 *.go text eol=lf

@@ -54,6 +54,7 @@ if ! id -u soar-client >/dev/null 2>&1; then
 fi
 
 install -d -m 0750 -o root -g soar-client /etc/soar-client
+install -d -m 0750 -o root -g soar-client /etc/soar-client/instances
 install -d -m 0750 -o soar-client -g soar-client /var/lib/soar-client
 
 # Client configuration. Never overwrite an existing working profile.
@@ -81,13 +82,21 @@ if [ ! -f /etc/soar-client/candidates.txt ]; then
   fi
 fi
 
-# Mode selector and wrapper.
+# Mode selector and wrappers.
 if [ ! -f /etc/soar-client/mode.env ]; then
   install -m 0640 -o root -g soar-client "$SCRIPT_DIR/mode.env.example" /etc/soar-client/mode.env
 fi
 install -m 0755 "$SCRIPT_DIR/soar-client-run" /usr/local/bin/soar-client-run
+install -m 0755 "$SCRIPT_DIR/soar-client-instance" /usr/local/bin/soar-client-instance
+
+# Per-instance example. Copy it to 1.env, 2.env, ... and edit; do not enable
+# all instances until each listener and credential is set.
+if [ ! -f /etc/soar-client/instances/example.env ]; then
+  install -m 0600 -o root -g root "$SCRIPT_DIR/instance.env.example" /etc/soar-client/instances/example.env
+fi
 
 install -m 0644 "$SCRIPT_DIR/soar-client.service" /etc/systemd/system/soar-client.service
+install -m 0644 "$SCRIPT_DIR/soar-client@.service" /etc/systemd/system/soar-client@.service
 systemctl daemon-reload
 
 if grep -q 'your-zone.u.example.com' /etc/soar-client/client.json; then
@@ -117,5 +126,7 @@ say "  logs   : journalctl -u soar-client -f"
 say "  mode   : /etc/soar-client/mode.env"
 say "  config : /etc/soar-client/client.json"
 say "  list   : /etc/soar-client/resolvers.txt"
+say "  multi  : /etc/soar-client/instances/example.env (copy to 1.env ...)"
+say "           systemctl enable --now soar-client@1"
 say "  SOCKS  : from client.json (default 127.0.0.1:10886; TCP CONNECT only)"
-say "           public binds require username/password in client.json"
+say "           public binds require username/password in client.json or SOAR_* env"

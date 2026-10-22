@@ -5,8 +5,12 @@ set -eu
 
 MODE_FILE="${SOAR_MODE_FILE:-/etc/soar-client/mode.env}"
 if [ -r "$MODE_FILE" ]; then
+  # Export all assignments so SOAR_LISTEN/SOAR_USERNAME/SOAR_PASSWORD reach
+  # the binary as environment overrides, not just the shell.
+  set -a
   # shellcheck disable=SC1090
   . "$MODE_FILE"
+  set +a
 fi
 
 # Intentional word splitting: SOAR_ARGS is a list of command-line arguments.

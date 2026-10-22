@@ -16,10 +16,13 @@ PURGE=0
 }
 
 systemctl disable --now soar-client.service 2>/dev/null || true
-rm -f /etc/systemd/system/soar-client.service
+for unit in $(systemctl list-units --type=service --all --no-legend 'soar-client@*.service' 2>/dev/null | awk '{print $1}'); do
+  systemctl disable --now "$unit" 2>/dev/null || true
+done
+rm -f /etc/systemd/system/soar-client.service /etc/systemd/system/soar-client@.service
 systemctl daemon-reload
 
-rm -f /usr/local/bin/soar-client /usr/local/bin/soar-client-run
+rm -f /usr/local/bin/soar-client /usr/local/bin/soar-client-run /usr/local/bin/soar-client-instance
 
 if [ "$PURGE" -eq 1 ]; then
   rm -rf /etc/soar-client /var/lib/soar-client

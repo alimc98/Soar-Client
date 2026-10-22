@@ -22,7 +22,7 @@ import (
 	"github.com/getlantern/soar"
 )
 
-var clientVersion = "1.1.0"
+var clientVersion = "1.2.0"
 
 const engineVersion = "1.6.7"
 
@@ -137,6 +137,10 @@ func (c config) clientConfig(resolvers []string) soar.Config {
 	}
 }
 
+// loadConfig decodes the JSON file without validating it. Callers apply
+// environment/flag overrides first, then call validate once on the final
+// configuration. This is what lets SOAR_LISTEN/SOAR_USERNAME/SOAR_PASSWORD
+// repair a public listener that would be invalid on its own.
 func loadConfig(path string) (config, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -149,10 +153,33 @@ func loadConfig(path string) (config, error) {
 	if err := decoder.Decode(&cfg); err != nil {
 		return config{}, errors.New("invalid Soar engine JSON configuration")
 	}
+	return cfg, nil
+}
+
+func loadConfigValidated(path string) (config, error) {
+	cfg, err := loadConfig(path)
+	if err != nil {
+		return config{}, err
+	}
 	if err := cfg.validate(); err != nil {
 		return config{}, err
 	}
 	return cfg, nil
+}
+
+// applyEnvOverrides lets systemd instances or a shell override the listener
+// and credentials without duplicating the tunnel configuration. Precedence is
+// config file < environment < command-line flags.
+func applyEnvOverrides(cfg *config) {
+	if v, ok := os.LookupEnv("SOAR_LISTEN"); ok && strings.TrimSpace(v) != "" {
+		cfg.Listen = strings.TrimSpace(v)
+	}
+	if v, ok := os.LookupEnv("SOAR_USERNAME"); ok {
+		cfg.Username = v
+	}
+	if v, ok := os.LookupEnv("SOAR_PASSWORD"); ok {
+		cfg.Password = v
+	}
 }
 
 func main() {
@@ -212,12 +239,21 @@ Client flags:
   -scan               shorthand for -mode auto
   -scan-only          shorthand for -mode scan
   -listen ADDR        override the SOCKS listen address (public binds need auth)
+  -username USER      override the SOCKS username
+  -password PASS      override the SOCKS password
   -discovery on|off   override Soar discovery (default: off in manual/auto)
   -verify auto|on|off  verify survivors with a real Soar handshake
                       (default auto: on for auto/scan, off for manual)
   -verify-workers N   concurrent Soar verification probes (default 2)
   -max-resolvers N    runtime resolver cap (default 128)
   -version            print versions
+
+Listener / credential overrides (config file < environment < flags):
+  SOAR_LISTEN         SOCKS listen address, e.g. 0.0.0.0:10886
+  SOAR_USERNAME       SOCKS username (empty clears it)
+  SOAR_PASSWORD       SOCKS password (empty clears it)
+  -username/-password are visible in the process list; prefer the config file
+  or the SOAR_* environment variables for production.
 
 Scanner flags:
   -candidates FILE    IPs and/or CIDR ranges (default: bundled candidates)
@@ -273,6 +309,8 @@ func runClient(ctx context.Context, args []string) error {
 	scanFlag := fs.Bool("scan", false, "scan candidates, then connect")
 	scanOnly := fs.Bool("scan-only", false, "scan candidates and exit")
 	listenOverride := fs.String("listen", "", "override the SOCKS listen address")
+	usernameOverride := fs.String("username", "", "override the SOCKS username")
+	passwordOverride := fs.String("password", "", "override the SOCKS password")
 	discoveryFlag := fs.String("discovery", "", "on or off")
 	verifyFlag := fs.String("verify", "auto", "verify survivors: auto, on, or off")
 	verifyWorkers := fs.Int("verify-workers", 2, "concurrent Soar verification probes")
@@ -310,11 +348,26 @@ func runClient(ctx context.Context, args []string) error {
 		return errors.New("-config is required for manual and auto modes")
 	}
 
-	if *listenOverride != "" {
+	if mode != "scan" {
+		applyEnvOverrides(&cfg)
+	}
+	explicit := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+	if explicit["listen"] || explicit["username"] || explicit["password"] {
 		if mode == "scan" {
-			return errors.New("-listen is only valid when starting the client")
+			return errors.New("-listen, -username and -password are only valid when starting the client")
 		}
+	}
+	if explicit["listen"] {
 		cfg.Listen = *listenOverride
+	}
+	if explicit["username"] {
+		cfg.Username = *usernameOverride
+	}
+	if explicit["password"] {
+		cfg.Password = *passwordOverride
+	}
+	if *configFile != "" {
 		if err := cfg.validate(); err != nil {
 			return err
 		}

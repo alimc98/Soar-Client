@@ -102,7 +102,7 @@ func runScanCommand(ctx context.Context, args []string) error {
 	if *configFile == "" {
 		return errors.New("-verify needs -config so the Soar handshake can be authenticated")
 	}
-	cfg, err := loadConfig(*configFile)
+	cfg, err := loadConfigValidated(*configFile)
 	if err != nil {
 		return err
 	}

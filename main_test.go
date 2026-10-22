@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -243,6 +244,70 @@ func TestConfigBoundsAndPublicListenerAuth(t *testing.T) {
 	cfg.Soar.MaxQName = 101
 	if cfg.validate() == nil {
 		t.Fatal("invalid name limits accepted")
+	}
+}
+
+func TestEnvOverridesCanAuthenticatePublicListener(t *testing.T) {
+	cfg := defaults()
+	cfg.Zone = "t.example.com"
+	cfg.PublicKey = base64.StdEncoding.EncodeToString(make([]byte, 32))
+	cfg.Listen = "0.0.0.0:1080"
+	if cfg.validate() == nil {
+		t.Fatal("public listener without authentication was allowed")
+	}
+
+	t.Setenv("SOAR_LISTEN", "0.0.0.0:10999")
+	t.Setenv("SOAR_USERNAME", "env-user")
+	t.Setenv("SOAR_PASSWORD", "env-pass")
+	applyEnvOverrides(&cfg)
+	if cfg.Listen != "0.0.0.0:10999" || cfg.Username != "env-user" || cfg.Password != "env-pass" {
+		t.Fatalf("environment overrides not applied: %+v", cfg)
+	}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("authenticated public listener was rejected: %v", err)
+	}
+
+	t.Setenv("SOAR_USERNAME", "")
+	t.Setenv("SOAR_PASSWORD", "")
+	applyEnvOverrides(&cfg)
+	if cfg.Username != "" || cfg.Password != "" {
+		t.Fatal("empty environment values did not clear credentials")
+	}
+	if cfg.validate() == nil {
+		t.Fatal("cleared credentials left a public listener valid")
+	}
+}
+
+func TestLoadConfigDefersListenerValidation(t *testing.T) {
+	cfg := defaults()
+	cfg.Zone = "t.example.com"
+	cfg.PublicKey = base64.StdEncoding.EncodeToString(make([]byte, 32))
+	cfg.Listen = "0.0.0.0:10998"
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "client.json")
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("loadConfig rejected a public listener before overrides: %v", err)
+	}
+	if loaded.validate() == nil {
+		t.Fatal("unauthenticated public listener passed validation")
+	}
+	if _, err := loadConfigValidated(path); err == nil {
+		t.Fatal("validated loader accepted an unauthenticated public listener")
+	}
+
+	t.Setenv("SOAR_USERNAME", "u")
+	t.Setenv("SOAR_PASSWORD", "p")
+	applyEnvOverrides(&loaded)
+	if err := loaded.validate(); err != nil {
+		t.Fatalf("env overrides did not make the listener valid: %v", err)
 	}
 }
 

@@ -1,0 +1,30 @@
+[Unit]
+Description=Soar Client instance %i - authenticated DNS tunnel SOCKS5 proxy
+Documentation=https://github.com/alimc98/Soar-Client
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=soar-client
+Group=soar-client
+WorkingDirectory=/var/lib/soar-client
+EnvironmentFile=/etc/soar-client/instances/%i.env
+ExecStart=/usr/local/bin/soar-client-instance
+Restart=always
+RestartSec=8
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/soar-client
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
