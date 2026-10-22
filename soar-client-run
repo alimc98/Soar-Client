@@ -1,0 +1,14 @@
+#!/bin/sh
+# systemd starts this wrapper. It reads /etc/soar-client/mode.env so the mode
+# can be changed without editing the unit file.
+set -eu
+
+MODE_FILE="${SOAR_MODE_FILE:-/etc/soar-client/mode.env}"
+if [ -r "$MODE_FILE" ]; then
+  # shellcheck disable=SC1090
+  . "$MODE_FILE"
+fi
+
+# Intentional word splitting: SOAR_ARGS is a list of command-line arguments.
+: "${SOAR_ARGS:--mode manual -resolvers /etc/soar-client/resolvers.txt}"
+exec /usr/local/bin/soar-client -config /etc/soar-client/client.json $SOAR_ARGS

@@ -1,155 +1,373 @@
-# WhiteDNS Resolver Scanner (headless)
+# Soar Client
 
-A non-interactive DNS resolver scanner for the WhiteDNS Linux client, built on
-the [WhiteDNS cleanip-finder](https://github.com/WhiteDNS/WhiteDNS-cleanip-finder)
-engine.
+A Linux client for the WhiteDNS Soar DNS tunnel, built from the `Soar/` engine
+in [WhiteDNS/WhiteDNS-Desktop](https://github.com/WhiteDNS/WhiteDNS-Desktop),
+with the WhiteDNS resolver scanner integrated into the same binary.
 
-The upstream project ships a terminal UI. A headless client on a Linux server
-has no terminal, so this package adds a plain-flag command that runs the same
-`internal/dnsscan` engine over SSH and writes the same report set.
+The client exposes a **loopback SOCKS5 `CONNECT`** proxy. TCP traffic sent to
+the proxy travels through an authenticated DNS tunnel to the Soar server. A
+resolver can be supplied manually, or the client can scan candidate IPs/CIDRs,
+keep the resolvers that actually carry a tunnel, and start with that list.
 
-## What it checks
+> This project was renamed from `whitedns-resolver-scan` to `Soar-Client`.
+> The old repository only contained the standalone scanner; this repository is
+> the combined client + scanner.
 
-A resolver is only accepted when every one of these holds:
+> **Status:** client `1.0.0` was tested on 2026-10-22 on AlmaLinux 8.10 against
+> a live Soar `0.5.0` server. Manual and auto modes authenticated and carried
+> real HTTPS traffic through the tunnel; scan-only and scan+verify paths were
+> tested as well.
 
-| Check | Meaning |
-|---|---|
-| Clean A answer | The answer matches the truth table, so the resolver is not poisoned. |
-| Recursion available | The `RA` bit is set, so it really resolves. |
-| No NXDOMAIN hijack | Reserved names are not forged; the resolver is not a lying transparent proxy. |
-| TXT passthrough | TXT rdata comes back intact, which is the channel a DNS tunnel rides on. |
-| EDNS0 on the UDP path | Large UDP answers are not truncated, so the tunnel can carry payload. |
+## What is inside
 
-Rejected resolvers are still reported, with the reason, so a list can be tuned
-instead of guessed at.
-
-## Install
-
-On the Ubuntu/Debian client server:
-
-```bash
-tar -xzf whitedns-resolver-scan-1.0.0-linux-amd64.tar.gz
-cd whitedns-resolver-scan-1.0.0-linux-amd64
-sudo bash install.sh
+```
+Soar engine (WhiteDNS-Desktop/Soar 1.6.7)
+  + SOCKS5 CONNECT proxy
+  + authenticated startup HTTPS check
+  + resolver discovery / failover
+  + integrated WhiteDNS dnsscan engine
+      - clean A answer
+      - recursion available
+      - no NXDOMAIN hijack
+      - TXT passthrough
+      - EDNS0 on UDP
+  + final Soar handshake verification of every scan survivor
 ```
 
-That installs:
+The scanner checks are generic DNS checks. The final verification is stronger:
+it authenticates **your** Soar zone and public key through each candidate and
+fetches real HTTPS. A resolver that passes the DNS checks but cannot reach your
+server is discarded before the proxy starts.
 
-- `/usr/local/bin/dnsscan` — the scanner
-- `/etc/whitedns-scan/scan-resolvers.sh` — the wrapper script
-- `/etc/whitedns-scan/resolver-candidates.txt` — the candidate list
+## Modes
 
-## Run a scan
+| Mode | How it gets resolvers | Command |
+|---|---|---|
+| `manual` | Your `resolvers.txt` (IP or `IP:port`, comments allowed) | `soar-client run -config client.json -resolvers resolvers.txt` |
+| `auto` | Scans candidates, verifies survivors, then starts the proxy | `soar-client run -config client.json -scan -candidates candidates.txt` |
+| `scan` | Scans only; writes reports and a resolver list | `soar-client scan -candidates candidates.txt -out-list resolvers-valid.txt` |
+
+`manual` and `auto` disable Soar's built-in discovery by default, so the list
+you measured is the list that is used. Add `-discovery on` if you also want the
+bundled country/global fallback.
+
+## Quick start
+
+### 1. Build
+
+Go 1.25 or newer is required.
 
 ```bash
-cd /etc/whitedns-scan
-sudo ./scan-resolvers.sh --samples 5 --workers 64
+./build.sh 1.0.0
 ```
-
-The candidate list holds CIDR ranges, so the scanner samples addresses inside
-each range instead of probing every address. `--samples 5` means five probes
-per range, spread evenly over its usable host addresses.
 
 Output:
 
 ```
-/etc/whitedns-scan/resolvers-valid.txt   accepted resolver IPs, one per line
-/etc/whitedns-scan/dns-scan/              full report set (txt, csv, json, html, xlsx)
+dist/soar-client-linux-amd64
+dist/soar-client-linux-arm64
 ```
 
-Exit code is `0` when at least one resolver was accepted, `1` when none was.
-
-## Give the result to the client
-
-The bridge reads its resolvers from the profile or from `WHITEDNS_RESOLVERS`:
+### 2. Install
 
 ```bash
-sudo systemctl edit whitedns-bridge
-# [Service]
-# Environment=WHITEDNS_RESOLVERS=194.29.79.5,185.235.198.1
-sudo systemctl restart whitedns-bridge
+sudo bash install.sh
 ```
 
-To install the scan result as the default set:
+or, from a release tarball:
 
 ```bash
-sudo sh -c 'echo "WHITEDNS_RESOLVERS=$(tr "\n" "," < /etc/whitedns-scan/resolvers-valid.txt)" \
-  >> /etc/whitedns-bridge/bridge.env'
-sudo systemctl restart whitedns-bridge
+tar -xzf soar-client-1.0.0-linux-amd64.tar.gz
+cd soar-client-1.0.0-linux-amd64
+sudo bash install.sh
 ```
 
-The client also runs its own discovery: when `discovery` is on in the profile,
-it tries the bundled `ir.txt` and `global.txt` lists and samples the bundled
-Iranian ranges. The scanner is the tool for replacing that guesswork with a
-list measured on the host that will actually run the tunnel.
+The installer creates:
 
-## Direct use
+| Path | Purpose |
+|---|---|
+| `/usr/local/bin/soar-client` | client + scanner binary |
+| `/usr/local/bin/soar-client-run` | reads `/etc/soar-client/mode.env` and starts the client |
+| `/etc/soar-client/client.json` | Soar zone, public key, listen address, advanced options |
+| `/etc/soar-client/resolvers.txt` | manual resolver list |
+| `/etc/soar-client/candidates.txt` | bundled Iranian CIDR list for auto mode |
+| `/etc/soar-client/mode.env` | selects manual or auto mode for systemd |
+| `/etc/systemd/system/soar-client.service` | systemd unit |
+| `/var/lib/soar-client/` | scan reports and generated resolver lists |
+
+Edit `/etc/soar-client/client.json` and set `zone` and `server_public_key` from
+the Soar panel account. Then:
 
 ```bash
-dnsscan -list candidates.txt -out reports -samples 5 -protocol both -depth full
+systemctl enable --now soar-client
+journalctl -u soar-client -f
 ```
+
+When the tunnel is ready the log contains:
+
+```
+SOAR_READY authenticated=1 https=1
+```
+
+The SOCKS proxy is `127.0.0.1:10886` by default.
+
+### 3. Manual mode
+
+Put your working resolvers in `/etc/soar-client/resolvers.txt`:
+
+```
+1.1.1.1
+8.8.8.8
+9.9.9.9
+217.218.155.155
+178.252.143.133
+```
+
+Start:
+
+```bash
+soar-client run -config /etc/soar-client/client.json \
+  -mode manual -resolvers /etc/soar-client/resolvers.txt
+```
+
+Manual mode starts immediately by default: the list is yours, so the client
+does not add a verification delay. Use `-verify=on` if you want every entry
+checked with a real Soar handshake before the SOCKS listener is opened, or
+`-verify=off` to make the fast path explicit.
+
+### 4. Auto mode
+
+```bash
+soar-client run -config /etc/soar-client/client.json \
+  -mode auto \
+  -candidates /etc/soar-client/candidates.txt \
+  -scan-out /var/lib/soar-client/scan \
+  -scan-list /var/lib/soar-client/resolvers-auto.txt
+```
+
+What happens:
+
+1. The candidate file is expanded. CIDR ranges are sampled with `-samples`
+   (default 5 addresses per range, spread evenly over usable hosts).
+2. Every address is probed by the integrated `dnsscan` engine.
+3. Survivors are verified with the real Soar server key/zone and HTTPS.
+4. The verified list is written to `-scan-list` and used to start the proxy.
+5. Reports are written to `-scan-out`.
+
+The default embedded candidate list is the Iranian CIDR snapshot in
+`data/resolver-candidates.txt`. `-candidates embedded` selects it explicitly.
+
+### 5. Scan only
+
+```bash
+soar-client scan \
+  -candidates /etc/soar-client/candidates.txt \
+  -samples 5 \
+  -workers 64 \
+  -protocol both \
+  -depth full \
+  -out /var/lib/soar-client/scan \
+  -out-list /var/lib/soar-client/resolvers-valid.txt
+```
+
+The standalone `scan` subcommand verifies only when you add `-config client.json
+-verify`; this is different from `run -mode scan`, which verifies by default:
+
+```bash
+soar-client scan -candidates candidates.txt \
+  -out-list resolvers-valid.txt \
+  -config /etc/soar-client/client.json -verify
+```
+
+## Scanner flags
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `-list` | — | File of resolver IPs and/or CIDR ranges |
-| `-out` | `dns-scan` | Report directory |
-| `-out-list` | — | Extra file for the accepted IPs |
-| `-samples` | `0` | Addresses per CIDR range (`0` = every address) |
-| `-protocol` | `udp` | `udp`, `tcp`, `both`, `all` |
-| `-ports` | `53` | Ports to probe |
-| `-workers` | `64` | Concurrent probes |
-| `-timeout` | `3s` | Per-probe timeout |
-| `-depth` | `fast` | `fast` (skips hijack validation) or `full` |
-| `-domain` | `google.com` | A-record integrity domain |
-| `-txt-domain` | `_dmarc.google.com` | TXT probe target |
-| `-truth` | `google` | Reference resolver: `google`, `cloudflare`, `quad9` |
-| `-score` | `0` | Minimum compatibility score to keep |
-| `-nearby` | off | Expand the `/24` around every hit and rescan it |
-| `-rate` | `0` | Whole-scan query rate limit |
-| `-rate-per-resolver` | `0` | Per-resolver query rate limit |
-| `-quiet` | off | Only print the summary |
+| `-candidates FILE` | embedded | IPs and/or CIDR ranges; `-list` is an alias |
+| `-samples N` | `5` | Addresses per CIDR (`0` = every host; large ranges are refused) |
+| `-protocol P` | `both` | `udp`, `tcp`, `both`, `all` |
+| `-ports LIST` | `53` | Ports to probe |
+| `-workers N` | `64` | Concurrent resolver probes |
+| `-scan-timeout D` | `3s` | Per-probe timeout (`-timeout` alias) |
+| `-depth MODE` | `full` | `fast` skips hijack validation; `full` runs every check |
+| `-domain NAME` | `google.com` | A-record integrity domain |
+| `-txt-domain NAME` | `_dmarc.google.com` | TXT passthrough target |
+| `-truth P` | `google` | Reference resolver: `google`, `cloudflare`, `quad9` |
+| `-score N` | `0` | Minimum compatibility score |
+| `-nearby` | off | Expand the `/24` around every hit and rescan |
+| `-rate N` | `0` | Whole-scan query rate limit |
+| `-rate-per-resolver N` | `0` | Per-resolver query rate limit |
+| `-quiet` | off | Only print the final summary |
 
-### `-txt-domain` matters
+Accepted resolvers are those with `TunnelReady && Status == valid`: at least
+one clean recursive transport with TXT passthrough, and no resolver-wide
+NXDOMAIN hijack. For UDP, EDNS0 must also work.
 
-The TXT probe target must be a name that actually carries a TXT record. The
-engine's default (`google.com`) has none, so every resolver comes back as
-`no-txt-passthrough` and nothing is accepted. `_dmarc.google.com` works out of
-the box; for a true end-to-end echo test, point it at a zone you control.
+### Why `-txt-domain` matters
 
-## Build from source
+The TXT target must actually have a TXT record. The engine's old default
+(`google.com`) has none, so every resolver looks like it fails TXT passthrough.
+`_dmarc.google.com` works out of the box. For a true end-to-end echo test,
+point this at a zone you control.
 
-The scanner command is `cmd/dnsscanheadless/main.go` in this repo. It imports
-the upstream module's internal `dnsscan` package, so it has to be compiled
-inside the upstream tree. `build.sh` does that:
+## Client flags
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `-config FILE` | — | client JSON; required for manual/auto |
+| `-resolvers FILE` | — | manual resolver list |
+| `-mode MODE` | inferred | `manual`, `auto`, `scan` |
+| `-scan` | off | shorthand for `-mode auto` |
+| `-scan-only` | off | shorthand for `-mode scan` |
+| `-listen ADDR` | from config | override the loopback SOCKS listener |
+| `-discovery on\|off` | off in manual/auto | add bundled Soar discovery fallback |
+| `-verify` | `auto` | `auto` = on for auto/scan, off for manual; or `on` / `off` |
+| `-verify-workers N` | `2` | concurrent verification probes |
+| `-max-resolvers N` | `128` | cap for the runtime list |
+| `-version` | — | print versions |
+
+The legacy form still works:
 
 ```bash
-bash build.sh 1.0.0
+soar-client -config client.json -resolvers resolvers.txt
 ```
 
-It clones cleanip-finder at a pinned commit, copies the command into
-`cmd/dnsscanheadless/`, and cross-compiles `dnsscan-linux-amd64` and
-`dnsscan-linux-arm64`. Then:
+## systemd mode selection
+
+The unit starts `/usr/local/bin/soar-client-run`, which sources
+`/etc/soar-client/mode.env`. To switch modes, edit that file and restart:
 
 ```bash
-bash package.sh 1.0.0
+# manual
+SOAR_ARGS="-mode manual -resolvers /etc/soar-client/resolvers.txt"
+
+# auto
+SOAR_ARGS="-mode auto -candidates /etc/soar-client/candidates.txt -scan-out /var/lib/soar-client/scan -scan-list /var/lib/soar-client/resolvers-auto.txt -samples 5 -workers 64 -depth full -verify-workers 2"
 ```
 
-## Layout
+```bash
+systemctl restart soar-client
+```
+
+In auto mode the service scans on every start. That makes startup slower than
+manual mode, but the resolver list is always measured on the host that will
+actually run the tunnel. For a fast restart, run auto mode once, then switch
+the service to the generated list with manual mode.
+
+## Reports
+
+`soar-client scan` writes timestamped files:
 
 ```
-cmd/dnsscanheadless/main.go   the headless scanner command
-build.sh                       clone upstream, add the command, compile
-package.sh                     build the release tarballs
-install.sh                     install on Ubuntu/Debian
-scan-resolvers.sh              wrapper around the scanner
-resolver-candidates.txt        candidate CIDR ranges
+passed_clean_resolvers_*.txt   accepted resolver IPs
+tunnel_ready_ips_*.txt         tunnel-ready shortlist
+valid_dns_servers_*.txt        valid DNS servers
+resolvers_*.csv                every resolver, one row each
+resolvers_*.json               machine-readable full dump
+resolvers_*.html               colour-coded table
+resolvers_*.xlsx               spreadsheet with status colours
+dns-results-*.txt              human-readable per-resolver details
 ```
+
+The stable list is the `-out-list` / `-scan-list` file. It contains one IP per
+line and is what manual mode and the service consume.
+
+## Security notes
+
+- The SOCKS listener **must** be loopback. `0.0.0.0` is rejected.
+- Only TCP `CONNECT` is supported. `BIND` and `UDP ASSOCIATE` are rejected.
+- The tunnel carries TCP only; do not route UDP/QUIC through it.
+- The Soar server controls the destination allow-list (for example ports 80 and
+  443). Change it in the panel, not in the client.
+- The private key never leaves the server. The client only has the public key.
+- `/etc/soar-client/client.json` is mode `0640` and owned by `root:soar-client`.
+- Scan reports can reveal network topology; keep `/var/lib/soar-client` private.
+
+## Troubleshooting
+
+| Symptom | What to check |
+|---|---|
+| `no authenticated DNS tunnel` | zone/public key, NS delegation, server port 53, resolver reachability |
+| `no resolver passed the scanner` | use `-depth full`, `-protocol both`, a longer `-samples`, or a different candidate file |
+| Auto mode takes a long time | verification is intentionally strict; reduce the candidate set, use `-verify-workers 4`, or scan once and switch to manual |
+| A resolver passes DNS but not Soar | expected: the final handshake gate is specific to your server key and zone |
+| The proxy connects but sites fail | server `allow_ports`; the client only supports TCP CONNECT |
+| Port 10886 is busy | stop the old `whitedns-soar` service or override `-listen` |
+| DNS is hijacked on the client host | that is the problem Soar is designed to bypass; the tunnel uses the resolver path, not the host resolver |
+
+## Build and test
+
+```bash
+go test ./...
+./build.sh 1.0.0
+```
+
+The test suite covers the Soar config bounds, SOCKS negotiation, hostname
+preservation, HTTPS certificate validation, resolver planning, CIDR expansion,
+and candidate parsing. The scanner package is built from the upstream engine;
+see `THIRD_PARTY.md` for provenance.
+
+## Repository rename
+
+The local Git remote still points at the old name. To finish the rename on
+GitHub:
+
+1. Open `https://github.com/alimc98/whitedns-resolver-scan/settings`.
+2. Rename the repository to `Soar-Client`.
+3. Update the remote and push:
+
+```bash
+git remote set-url origin https://github.com/alimc98/Soar-Client.git
+git push -u origin main
+```
+
+GitHub keeps redirects from the old URL for a while, so existing clones keep
+working.
 
 ## Credits
 
-The scanner engine, the acceptance rule, and the report formats come from
-[WhiteDNS/WhiteDNS-cleanip-finder](https://github.com/WhiteDNS/WhiteDNS-cleanip-finder),
-used as an upstream dependency and not copied into this repository.
+- Soar engine: [getlantern/soar](https://github.com/getlantern/soar) v0.2.3,
+  Apache-2.0, with WhiteDNS transport fixes.
+- Client source: [WhiteDNS/WhiteDNS-Desktop](https://github.com/WhiteDNS/WhiteDNS-Desktop)
+  `Soar/` v1.6.7.
+- Scanner engine: [WhiteDNS/WhiteDNS-cleanip-finder](https://github.com/WhiteDNS/WhiteDNS-cleanip-finder)
+  `internal/dnsscan` at commit `55960618b924018bda3e883155702ed7312eff98`.
+- Iranian resolver/range snapshots: KevinNet DNS, MIT.
 
-`resolver-candidates.txt` is the Iranian range set shipped with the WhiteDNS
-Soar engine, itself credited to KevinNet DNS (MIT).
+See `THIRD_PARTY.md` for details.
+
+---
+
+## راهنمای سریع فارسی
+
+این پروژه همان کلاینت Soar (از ریپوی `WhiteDNS-Desktop`) است که اسکنر ریزالور
+هم داخل خودش قرار گرفته و اسمش از `whitedns-resolver-scan` به `Soar-Client`
+تغییر کرده است.
+
+حالت دستی:
+
+```bash
+soar-client run -config /etc/soar-client/client.json \
+  -mode manual -resolvers /etc/soar-client/resolvers.txt
+```
+
+حالت خودکار (خودش اسکن می‌کند، ریزالور سالم را پیدا و تأیید می‌کند و بالا
+می‌آید):
+
+```bash
+soar-client run -config /etc/soar-client/client.json \
+  -mode auto -candidates /etc/soar-client/candidates.txt \
+  -scan-out /var/lib/soar-client/scan \
+  -scan-list /var/lib/soar-client/resolvers-auto.txt
+```
+
+فقط اسکن:
+
+```bash
+soar-client scan -candidates /etc/soar-client/candidates.txt \
+  -out-list /var/lib/soar-client/resolvers-valid.txt
+```
+
+خروجی SOCKS روی `127.0.0.1:10886` است و فقط TCP `CONNECT` را پشتیبانی می‌کند.
+برای سرویس systemd فایل `/etc/soar-client/mode.env` را ویرایش کنید و بعد
+`systemctl restart soar-client` بزنید.

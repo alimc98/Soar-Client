@@ -1,0 +1,862 @@
+package dnsscan
+
+import (
+	"archive/zip"
+	"bytes"
+	"encoding/csv"
+	"encoding/json"
+	"fmt"
+	"html"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// ReportPaths lists the files written by WriteReports.
+type ReportPaths struct {
+	Dir            string
+	Full           string // human-readable per-resolver + header dump
+	Valid          string // plain IP list of working, unpoisoned resolvers (usable DNS servers)
+	TunnelReady    string // tunnel-ready shortlist (human-readable)
+	TunnelReadyIPs string // plain IP list of tunnel-ready resolvers, one per line (E2E input)
+	Passed         string // plain IP list of clean (valid) resolvers, one per line
+	CSV            string
+	HTML           string // colour-coded per-status table (opens in browser/Excel)
+	XLSX           string // real spreadsheet with per-status cell fills
+	JSON           string
+}
+
+// MobileReportPaths is the Android DNS export set. Paths are allocated once at
+// scan start and then overwritten after every chunk, so incremental persistence
+// never creates a new timestamped batch of files. It mirrors the desktop report
+// formats (txt + csv + html + xlsx + json) so phone scans produce the same
+// colour-coded spreadsheet/browser output, not just plain text.
+type MobileReportPaths struct {
+	Detailed  string // categorized passed/poison/hijack report with probe details (txt)
+	PassedRaw string // clean tunnel-ready resolver IPs only, one per line (txt)
+	CSV       string // every resolver, one row each (spreadsheet import)
+	HTML      string // colour-coded per-status table (opens in browser/Excel)
+	XLSX      string // real spreadsheet with per-status cell fills
+	JSON      string // machine-readable full dump
+}
+
+// NewMobileReportPaths allocates the stable result paths used by one Android DNS
+// scan. All files share a single timestamp so a chunk flush overwrites the same
+// set instead of allocating more. The caller should retain this value for every
+// chunk flush.
+func NewMobileReportPaths(dir string) (MobileReportPaths, error) {
+	var paths MobileReportPaths
+	if strings.TrimSpace(dir) == "" {
+		dir = "dns scan"
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return paths, err
+	}
+	stamp := time.Now().Format("20060102-150405")
+	paths.Detailed = filepath.Join(dir, fmt.Sprintf("dns-results-%s.txt", stamp))
+	paths.PassedRaw = filepath.Join(dir, fmt.Sprintf("dns-passed-raw-%s.txt", stamp))
+	paths.CSV = filepath.Join(dir, fmt.Sprintf("dns-resolvers-%s.csv", stamp))
+	paths.HTML = filepath.Join(dir, fmt.Sprintf("dns-resolvers-%s.html", stamp))
+	paths.XLSX = filepath.Join(dir, fmt.Sprintf("dns-resolvers-%s.xlsx", stamp))
+	paths.JSON = filepath.Join(dir, fmt.Sprintf("dns-resolvers-%s.json", stamp))
+	return paths, nil
+}
+
+// WriteMobileReports rewrites the Android result files. The detailed txt file
+// groups useful records into PASSED, POISON, and HIJACK sections (non-passing /
+// no-response targets are counted in the summary but not dumped); the raw txt
+// holds only clean tunnel-ready passed IPs. The csv/html/xlsx/json files carry
+// every scanned resolver — full desktop parity — so the colour-coded spreadsheet
+// and browser views are available on the phone too.
+func WriteMobileReports(paths MobileReportPaths, results []ResolverResult) error {
+	if strings.TrimSpace(paths.Detailed) == "" || strings.TrimSpace(paths.PassedRaw) == "" {
+		return fmt.Errorf("mobile DNS report paths are empty")
+	}
+	sorted := sortedResults(results)
+	if err := writeMobileDetailedReport(paths.Detailed, sorted); err != nil {
+		return err
+	}
+	if err := writeMobilePassedList(paths.PassedRaw, sorted); err != nil {
+		return err
+	}
+	if err := writeCSV(paths.CSV, sorted); err != nil {
+		return err
+	}
+	if err := writeHTML(paths.HTML, sorted); err != nil {
+		return err
+	}
+	if err := writeXLSX(paths.XLSX, sorted); err != nil {
+		return err
+	}
+	return writeJSON(paths.JSON, sorted)
+}
+
+// statusCounts tallies how many resolvers landed in each state.
+func statusCounts(results []ResolverResult) map[string]int {
+	c := map[string]int{}
+	for _, r := range results {
+		c[r.Status]++
+	}
+	return c
+}
+
+// WriteReports dumps every result to dir in txt, csv, and json (range-scout
+// parity: txt/csv/json export). Files are timestamped. dir is created if needed.
+func WriteReports(dir string, results []ResolverResult) (ReportPaths, error) {
+	var paths ReportPaths
+	if strings.TrimSpace(dir) == "" {
+		dir = "dns scan"
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return paths, err
+	}
+	ts := time.Now().Format("20060102_150405")
+	paths.Dir = dir
+
+	sorted := sortedResults(results)
+
+	paths.Full = filepath.Join(dir, fmt.Sprintf("dns_scan_%s.txt", ts))
+	if err := writeFullReport(paths.Full, sorted); err != nil {
+		return paths, err
+	}
+	paths.Valid = filepath.Join(dir, fmt.Sprintf("valid_dns_servers_%s.txt", ts))
+	if err := writeValidList(paths.Valid, sorted); err != nil {
+		return paths, err
+	}
+	paths.TunnelReady = filepath.Join(dir, fmt.Sprintf("tunnel_ready_%s.txt", ts))
+	if err := writeTunnelReport(paths.TunnelReady, sorted); err != nil {
+		return paths, err
+	}
+	paths.TunnelReadyIPs = filepath.Join(dir, fmt.Sprintf("tunnel_ready_ips_%s.txt", ts))
+	if err := writeTunnelReadyIPList(paths.TunnelReadyIPs, sorted); err != nil {
+		return paths, err
+	}
+	paths.Passed = filepath.Join(dir, fmt.Sprintf("passed_clean_resolvers_%s.txt", ts))
+	if err := writePassedList(paths.Passed, sorted); err != nil {
+		return paths, err
+	}
+	paths.CSV = filepath.Join(dir, fmt.Sprintf("resolvers_%s.csv", ts))
+	if err := writeCSV(paths.CSV, sorted); err != nil {
+		return paths, err
+	}
+	paths.HTML = filepath.Join(dir, fmt.Sprintf("resolvers_%s.html", ts))
+	if err := writeHTML(paths.HTML, sorted); err != nil {
+		return paths, err
+	}
+	paths.XLSX = filepath.Join(dir, fmt.Sprintf("resolvers_%s.xlsx", ts))
+	if err := writeXLSX(paths.XLSX, sorted); err != nil {
+		return paths, err
+	}
+	paths.JSON = filepath.Join(dir, fmt.Sprintf("resolvers_%s.json", ts))
+	if err := writeJSON(paths.JSON, sorted); err != nil {
+		return paths, err
+	}
+	return paths, nil
+}
+
+// SortResults orders results best-first (tunnel-ready, then score, then IP) —
+// the same order the report files use, so callers can render a matching list.
+func SortResults(results []ResolverResult) []ResolverResult { return sortedResults(results) }
+
+func sortedResults(results []ResolverResult) []ResolverResult {
+	sorted := append([]ResolverResult(nil), results...)
+	sort.Slice(sorted, func(i, j int) bool {
+		ri, rj := resultSortRank(sorted[i]), resultSortRank(sorted[j])
+		if ri != rj {
+			return ri < rj
+		}
+		if sorted[i].Score != sorted[j].Score {
+			return sorted[i].Score > sorted[j].Score // best first
+		}
+		if sorted[i].BestLatency != sorted[j].BestLatency {
+			if sorted[i].BestLatency == 0 {
+				return false
+			}
+			if sorted[j].BestLatency == 0 {
+				return true
+			}
+			return sorted[i].BestLatency < sorted[j].BestLatency
+		}
+		return sorted[i].IP < sorted[j].IP
+	})
+	return sorted
+}
+
+func resultSortRank(result ResolverResult) int {
+	if result.Passed() {
+		return 0
+	}
+	switch result.Status {
+	case StatusValid:
+		return 1
+	case StatusHijack:
+		return 2
+	case StatusPoison:
+		return 3
+	default:
+		return 4
+	}
+}
+
+func writeMobileDetailedReport(path string, results []ResolverResult) error {
+	c := statusCounts(results)
+	passed := 0
+	for _, r := range results {
+		if mobilePassed(r) {
+			passed++
+		}
+	}
+	other := len(results) - passed - c[StatusPoison] - c[StatusHijack]
+	if other < 0 {
+		other = 0
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "WhiteDNS Android DNS Results\nGenerated: %s\nTotal scanned: %d\n", time.Now().Format("2006-01-02 15:04:05"), len(results))
+	fmt.Fprintf(&b, "Passed: %d  Poison: %d  Hijack: %d  Other/failed: %d\n",
+		passed, c[StatusPoison], c[StatusHijack], other)
+	b.WriteString("Passed means at least one clean tunnel-capable transport, with no resolver-wide hijack detected.\n")
+
+	writeSection := func(title string, count int, include func(ResolverResult) bool) {
+		fmt.Fprintf(&b, "\n[%s] %d\n%s\n", title, count, strings.Repeat("=", 72))
+		for _, r := range results {
+			if !include(r) {
+				continue
+			}
+			fmt.Fprintf(&b, "%s  score=%d/6  latency=%dms  tunnel=%v  via=%s  nearby=%v\n",
+				r.IP, r.Score, r.BestLatency.Milliseconds(), r.TunnelReady, r.TunnelTransport, r.Nearby)
+			fmt.Fprintf(&b, "  UDP=%v TCP=%v RA=%v EDNS0=%v TXT-pass=%v reason=%s\n",
+				r.UDPOK, r.TCPOK, r.RA, r.EDNS, r.TxtPass, r.TunnelReason)
+			fmt.Fprintf(&b, "  DNS detection: AA=%v TC=%v RD=%v RCODE=%s QD=%d AN=%d NS=%d AR=%d\n",
+				r.AA, r.TC, r.RD, r.RCodes, r.QDCount, r.ANCount, r.NSCount, r.ARCount)
+			fmt.Fprintf(&b, "  transport=%s fallback=%s udp-poison=%v tcp-poison=%v disagreement=%v injection=%v\n",
+				r.PreferredTransport, r.FallbackTransport, r.UDPPoisoned, r.TCPPoisoned, r.TransportDisagreement, r.InjectionObserved)
+			if r.PoisonIP != "" {
+				fmt.Fprintf(&b, "  poison_ip=%s\n", r.PoisonIP)
+			}
+			if r.HijackIP != "" {
+				fmt.Fprintf(&b, "  hijack_ip=%s\n", r.HijackIP)
+			}
+			if r.HijackConfidence != "" && r.HijackConfidence != "none" {
+				fmt.Fprintf(&b, "  hijack_confidence=%s hijack_reason=%s paths=udp:%v,tcp:%v checks=%d anomalies=%d rcodes=%s\n",
+					r.HijackConfidence, r.HijackReason, r.HijackUDP, r.HijackTCP,
+					r.HijackChecks, r.HijackAnomalies, r.HijackRCodes)
+			}
+			for _, header := range r.HeaderDump() {
+				fmt.Fprintf(&b, "  %s\n", header)
+			}
+		}
+	}
+
+	writeSection("PASSED", passed, mobilePassed)
+	writeSection("POISON", c[StatusPoison], func(r ResolverResult) bool { return r.Status == StatusPoison })
+	writeSection("HIJACK", c[StatusHijack], func(r ResolverResult) bool { return r.Status == StatusHijack })
+	return os.WriteFile(path, []byte(b.String()), 0o644)
+}
+
+func mobilePassed(r ResolverResult) bool {
+	return r.Passed()
+}
+
+func writeMobilePassedList(path string, results []ResolverResult) error {
+	var b strings.Builder
+	for _, r := range results {
+		if mobilePassed(r) {
+			b.WriteString(r.IP)
+			b.WriteString("\n")
+		}
+	}
+	return os.WriteFile(path, []byte(b.String()), 0o644)
+}
+
+func writeFullReport(path string, results []ResolverResult) error {
+	var b strings.Builder
+	fmt.Fprintf(&b, "DNS Resolver / Tunnel Scan\nGenerated: %s\nTotal: %d\n", time.Now().Format("2006-01-02 15:04:05"), len(results))
+	c := statusCounts(results)
+	fmt.Fprintf(&b, "States: valid(green)=%d  poison(purple)=%d  hijack(yellow)=%d  invalid(red)=%d\n",
+		c[StatusValid], c[StatusPoison], c[StatusHijack], c[StatusInvalid])
+	b.WriteString("Score 0-6 = UDP + TCP + RA + EDNS0 + TXT-passthrough + answer-integrity\n")
+	b.WriteString("DNS detection shows only fields not already summarized: AA/TC/RD, per-path RCODE, QD and AN.\n")
+	b.WriteString(strings.Repeat("=", 90))
+	b.WriteString("\n")
+	for _, r := range results {
+		fmt.Fprintf(&b, "\n%-39s [%s] score=%d/6 tunnel=%s via=%s poison=%v hijack=%v %dms\n",
+			r.IP, strings.ToUpper(r.Status), r.Score, ynb(r.TunnelReady), r.TunnelTransport, r.Poisoned, r.Transparent, r.BestLatency.Milliseconds())
+		fmt.Fprintf(&b, "    RA=%v EDNS0=%v TXT-pass=%v UDP=%v TCP=%v reason=%s\n",
+			r.RA, r.EDNS, r.TxtPass, r.UDPOK, r.TCPOK, r.TunnelReason)
+		fmt.Fprintf(&b, "    DNS detection: AA=%v TC=%v RD=%v RCODE=%s QD=%d AN=%d NS=%d AR=%d\n",
+			r.AA, r.TC, r.RD, r.RCodes, r.QDCount, r.ANCount, r.NSCount, r.ARCount)
+		fmt.Fprintf(&b, "    transport=%s fallback=%s udp-poison=%v tcp-poison=%v disagreement=%v injection=%v\n",
+			r.PreferredTransport, r.FallbackTransport, r.UDPPoisoned, r.TCPPoisoned, r.TransportDisagreement, r.InjectionObserved)
+		if r.PoisonIP != "" {
+			fmt.Fprintf(&b, "    POISON: %s answered with off-truth IP(s) -> %s\n", r.IP, r.PoisonIP)
+		}
+		if r.HijackIP != "" {
+			fmt.Fprintf(&b, "    HIJACK forged A for nonexistent name -> %s\n", r.HijackIP)
+		}
+		if r.HijackConfidence != "" && r.HijackConfidence != "none" {
+			fmt.Fprintf(&b, "    HIJACK evidence confidence=%s reason=%s paths=udp:%v,tcp:%v checks=%d anomalies=%d rcodes=%s\n",
+				r.HijackConfidence, r.HijackReason, r.HijackUDP, r.HijackTCP,
+				r.HijackChecks, r.HijackAnomalies, r.HijackRCodes)
+		}
+		for _, hd := range r.HeaderDump() {
+			fmt.Fprintf(&b, "    %s\n", hd)
+		}
+	}
+	return os.WriteFile(path, []byte(b.String()), 0o644)
+}
+
+func writeTunnelReport(path string, results []ResolverResult) error {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Passed DNS Tunnel Resolvers\nGenerated: %s\n", time.Now().Format("2006-01-02 15:04:05"))
+	b.WriteString("Criteria: one clean recursive transport with TXT passthrough; UDP additionally requires EDNS0\n")
+	b.WriteString(strings.Repeat("=", 70))
+	b.WriteString("\n")
+	count := 0
+	for _, r := range results {
+		if !r.Passed() {
+			continue
+		}
+		count++
+		fmt.Fprintf(&b, "%-39s score=%d/6 via=%s poison=%v transparent=%v %dms\n",
+			r.IP, r.Score, r.TunnelTransport, r.Poisoned, r.Transparent, r.BestLatency.Milliseconds())
+	}
+	fmt.Fprintf(&b, "\nTotal passed: %d\n", count)
+	return os.WriteFile(path, []byte(b.String()), 0o644)
+}
+
+// ValidResolvers returns every resolver with at least one honest answer path
+// and no transparent-proxy hijack. A resolver may still show per-transport
+// poison evidence when, for example, UDP is injected but TCP is clean.
+func ValidResolvers(results []ResolverResult) []ResolverResult {
+	out := make([]ResolverResult, 0, len(results))
+	for _, r := range results {
+		if r.Status == StatusValid {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// writeValidList dumps working, unpoisoned resolver IPs one per line, ready to
+// paste into a resolv.conf / client DNS setting.
+func writeValidList(path string, results []ResolverResult) error {
+	var b strings.Builder
+	for _, r := range ValidResolvers(results) {
+		b.WriteString(r.IP)
+		b.WriteString("\n")
+	}
+	return os.WriteFile(path, []byte(b.String()), 0o644)
+}
+
+// writePassedList dumps only resolvers accepted by the canonical tunnel rule,
+// one per line with no headers, ready for a client/config or E2E validation.
+func writePassedList(path string, results []ResolverResult) error {
+	var b strings.Builder
+	for _, r := range results {
+		if r.Passed() {
+			b.WriteString(r.IP)
+			b.WriteString("\n")
+		}
+	}
+	return os.WriteFile(path, []byte(b.String()), 0o644)
+}
+
+// writeTunnelReadyIPList dumps the same canonical passed shortlist under the
+// legacy tunnel-ready filename used by the DNSTT E2E flow.
+func writeTunnelReadyIPList(path string, results []ResolverResult) error {
+	var b strings.Builder
+	for _, r := range results {
+		if r.Passed() {
+			b.WriteString(r.IP)
+			b.WriteString("\n")
+		}
+	}
+	return os.WriteFile(path, []byte(b.String()), 0o644)
+}
+
+func writeCSV(path string, results []ResolverResult) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	w := csv.NewWriter(f)
+	// status + color make the per-state verdict explicit so spreadsheets can
+	// conditional-format it (poison=purple, hijack=yellow, valid=green,
+	// invalid=red); resolvers_*.html renders those colours directly.
+	_ = w.Write([]string{
+		"ip", "status", "color", "score", "responded",
+		"udp", "tcp", "preferred_transport", "fallback_transport",
+		"udp_poisoned", "tcp_poisoned", "transport_disagreement", "injection_observed",
+		"ra", "aa", "tc", "rd", "rcodes", "qd_records", "an_records",
+		"edns", "txt_pass", "ns_records", "ar_records",
+		"poisoned", "poison_ip",
+		"hijacked", "hijack_confidence", "hijack_reason", "hijack_udp", "hijack_tcp",
+		"hijack_checks", "hijack_anomalies", "hijack_rcodes", "hijack_ip",
+		"tunnel_ready", "latency_ms", "nearby", "reason",
+	})
+	for _, r := range results {
+		_ = w.Write([]string{
+			r.IP,
+			r.Status,
+			StatusColor(r.Status),
+			strconv.Itoa(r.Score),
+			strconv.FormatBool(r.Responded),
+			strconv.FormatBool(r.UDPOK),
+			strconv.FormatBool(r.TCPOK),
+			r.PreferredTransport,
+			r.FallbackTransport,
+			strconv.FormatBool(r.UDPPoisoned),
+			strconv.FormatBool(r.TCPPoisoned),
+			strconv.FormatBool(r.TransportDisagreement),
+			strconv.FormatBool(r.InjectionObserved),
+			strconv.FormatBool(r.RA),
+			strconv.FormatBool(r.AA),
+			strconv.FormatBool(r.TC),
+			strconv.FormatBool(r.RD),
+			r.RCodes,
+			strconv.Itoa(r.QDCount),
+			strconv.Itoa(r.ANCount),
+			strconv.FormatBool(r.EDNS),
+			strconv.FormatBool(r.TxtPass),
+			strconv.Itoa(r.NSCount),
+			strconv.Itoa(r.ARCount),
+			strconv.FormatBool(r.Poisoned),
+			r.PoisonIP,
+			strconv.FormatBool(r.Transparent),
+			r.HijackConfidence,
+			r.HijackReason,
+			strconv.FormatBool(r.HijackUDP),
+			strconv.FormatBool(r.HijackTCP),
+			strconv.Itoa(r.HijackChecks),
+			strconv.Itoa(r.HijackAnomalies),
+			r.HijackRCodes,
+			r.HijackIP,
+			strconv.FormatBool(r.TunnelReady),
+			strconv.FormatInt(r.BestLatency.Milliseconds(), 10),
+			strconv.FormatBool(r.Nearby),
+			r.TunnelReason,
+		})
+	}
+	w.Flush()
+	return w.Error()
+}
+
+// htmlStatusFill maps a status to a spreadsheet/browser-friendly row fill.
+var htmlStatusFill = map[string]string{
+	StatusPoison:  "#b39ddb", // purple
+	StatusHijack:  "#fff59d", // yellow
+	StatusValid:   "#a5d6a7", // green
+	StatusInvalid: "#ef9a9a", // red
+}
+
+// writeHTML renders a colour-coded table where every row is filled by resolver
+// status (poison=purple, hijack=yellow, valid=green, invalid=red). It opens in
+// any browser and imports into Excel/LibreOffice with the fills preserved, so
+// the colours requested for the CSV are actually visible. Columns surface the
+// EDNS0, TXT-passthrough, and compact DNS detection data per resolver.
+func writeHTML(path string, results []ResolverResult) error {
+	c := statusCounts(results)
+	var b strings.Builder
+	esc := html.EscapeString
+	b.WriteString("<!doctype html><meta charset=\"utf-8\"><title>DNS Resolver Scan</title>\n")
+	b.WriteString("<style>body{font:13px system-ui,Segoe UI,Arial,sans-serif;margin:16px}" +
+		"table{border-collapse:collapse;width:100%}th,td{border:1px solid #999;padding:3px 7px;text-align:left;white-space:nowrap}" +
+		"th{background:#333;color:#fff;position:sticky;top:0}code{font:12px Consolas,monospace}" +
+		".scroll{overflow:auto;max-height:80vh}.detail{max-width:360px;white-space:normal}" +
+		".legend span{display:inline-block;padding:2px 8px;margin-right:8px;border:1px solid #999}</style>\n")
+	fmt.Fprintf(&b, "<h2>DNS Resolver / Tunnel Scan</h2><p>Generated: %s &middot; Total: %d</p>\n",
+		esc(time.Now().Format("2006-01-02 15:04:05")), len(results))
+	fmt.Fprintf(&b, "<p class=legend>"+
+		"<span style=\"background:%s\">valid: %d</span>"+
+		"<span style=\"background:%s\">poison: %d</span>"+
+		"<span style=\"background:%s\">hijack: %d</span>"+
+		"<span style=\"background:%s\">invalid: %d</span></p>\n",
+		htmlStatusFill[StatusValid], c[StatusValid], htmlStatusFill[StatusPoison], c[StatusPoison],
+		htmlStatusFill[StatusHijack], c[StatusHijack], htmlStatusFill[StatusInvalid], c[StatusInvalid])
+	headers := []string{
+		"IP", "Status", "Score", "RA", "AA", "TC", "RD", "RCODE", "QD", "AN", "EDNS0", "TXT-pass",
+		"UDP", "TCP", "Preferred", "Fallback",
+		"UDP poison", "TCP poison", "Disagree", "Injection",
+		"NS", "AR", "Poison", "Poison IP",
+		"Hijack", "Confidence", "Hijack path", "Checks", "Anomalies", "Hijack RCODEs", "Hijack IP", "Hijack evidence",
+		"Tunnel", "ms", "Reason",
+	}
+	b.WriteString("<div class=scroll><table><tr>")
+	for _, header := range headers {
+		fmt.Fprintf(&b, "<th>%s</th>", esc(header))
+	}
+	b.WriteString("</tr>\n")
+	for _, r := range results {
+		fill := htmlStatusFill[r.Status]
+		if fill == "" {
+			fill = htmlStatusFill[StatusInvalid]
+		}
+		hijackPath := ""
+		if r.HijackUDP {
+			hijackPath = "udp"
+		}
+		if r.HijackTCP {
+			if hijackPath != "" {
+				hijackPath += "+tcp"
+			} else {
+				hijackPath = "tcp"
+			}
+		}
+		cells := []string{
+			r.IP, strings.ToUpper(r.Status), fmt.Sprintf("%d/6", r.Score),
+			ynb(r.RA), ynb(r.AA), ynb(r.TC), ynb(r.RD), r.RCodes,
+			strconv.Itoa(r.QDCount), strconv.Itoa(r.ANCount), ynb(r.EDNS), ynb(r.TxtPass),
+			ynb(r.UDPOK), ynb(r.TCPOK), r.PreferredTransport, r.FallbackTransport,
+			ynb(r.UDPPoisoned), ynb(r.TCPPoisoned), ynb(r.TransportDisagreement), ynb(r.InjectionObserved),
+			strconv.Itoa(r.NSCount), strconv.Itoa(r.ARCount), ynb(r.Poisoned), r.PoisonIP,
+			ynb(r.Transparent), r.HijackConfidence, hijackPath,
+			strconv.Itoa(r.HijackChecks), strconv.Itoa(r.HijackAnomalies), r.HijackRCodes, r.HijackIP, r.HijackReason,
+			ynb(r.TunnelReady), strconv.FormatInt(r.BestLatency.Milliseconds(), 10),
+			r.TunnelReason,
+		}
+		fmt.Fprintf(&b, "<tr style=\"background:%s\">", fill)
+		for index, cell := range cells {
+			className := ""
+			if index == 31 || index == 34 {
+				className = " class=detail"
+			}
+			fmt.Fprintf(&b, "<td%s>%s</td>", className, esc(cell))
+		}
+		b.WriteString("</tr>\n")
+	}
+	b.WriteString("</table></div>\n")
+	return os.WriteFile(path, []byte(b.String()), 0o644)
+}
+
+// jsonResolver is the export view (flattened, no raw probe internals).
+type jsonResolver struct {
+	IP                    string   `json:"ip"`
+	Status                string   `json:"status"`
+	Color                 string   `json:"color"`
+	Score                 int      `json:"score"`
+	Responded             bool     `json:"responded"`
+	UDP                   bool     `json:"udp"`
+	TCP                   bool     `json:"tcp"`
+	UDPPoisoned           bool     `json:"udp_poisoned"`
+	TCPPoisoned           bool     `json:"tcp_poisoned"`
+	InjectionObserved     bool     `json:"injection_observed"`
+	TransportDisagreement bool     `json:"transport_disagreement"`
+	PreferredTransport    string   `json:"preferred_transport,omitempty"`
+	FallbackTransport     string   `json:"fallback_transport,omitempty"`
+	RA                    bool     `json:"recursion_available"`
+	AA                    bool     `json:"authoritative_answer"`
+	TC                    bool     `json:"truncated"`
+	RD                    bool     `json:"recursion_desired"`
+	RCodes                string   `json:"rcodes,omitempty"`
+	QDCount               int      `json:"question_records"`
+	ANCount               int      `json:"answer_records"`
+	EDNS                  bool     `json:"edns0"`
+	TxtPass               bool     `json:"txt_passthrough"`
+	NSCount               int      `json:"ns_records"`
+	ARCount               int      `json:"ar_records"`
+	Poisoned              bool     `json:"poisoned"`
+	PoisonIP              string   `json:"poison_ip,omitempty"`
+	HijackIP              string   `json:"hijack_ip,omitempty"`
+	HijackConfidence      string   `json:"hijack_confidence,omitempty"`
+	HijackReason          string   `json:"hijack_reason,omitempty"`
+	HijackUDP             bool     `json:"hijack_udp"`
+	HijackTCP             bool     `json:"hijack_tcp"`
+	HijackChecks          int      `json:"hijack_checks"`
+	HijackAnomalies       int      `json:"hijack_anomalies"`
+	HijackRCodes          string   `json:"hijack_rcodes,omitempty"`
+	Transparent           bool     `json:"transparent_proxy"`
+	TunnelReady           bool     `json:"tunnel_ready"`
+	LatencyMs             int64    `json:"latency_ms"`
+	Nearby                bool     `json:"nearby"`
+	Reason                string   `json:"reason"`
+	Headers               []string `json:"headers"`
+}
+
+func writeJSON(path string, results []ResolverResult) error {
+	out := make([]jsonResolver, 0, len(results))
+	for _, r := range results {
+		out = append(out, jsonResolver{
+			IP: r.IP, Status: r.Status, Color: StatusColor(r.Status), Score: r.Score,
+			Responded: r.Responded, UDP: r.UDPOK, TCP: r.TCPOK,
+			UDPPoisoned: r.UDPPoisoned, TCPPoisoned: r.TCPPoisoned,
+			InjectionObserved: r.InjectionObserved, TransportDisagreement: r.TransportDisagreement,
+			PreferredTransport: r.PreferredTransport, FallbackTransport: r.FallbackTransport,
+			RA: r.RA, AA: r.AA, TC: r.TC, RD: r.RD, RCodes: r.RCodes,
+			QDCount: r.QDCount, ANCount: r.ANCount,
+			EDNS: r.EDNS, TxtPass: r.TxtPass, NSCount: r.NSCount, ARCount: r.ARCount,
+			Poisoned: r.Poisoned, PoisonIP: r.PoisonIP, HijackIP: r.HijackIP,
+			HijackConfidence: r.HijackConfidence, HijackReason: r.HijackReason,
+			HijackUDP: r.HijackUDP, HijackTCP: r.HijackTCP,
+			HijackChecks: r.HijackChecks, HijackAnomalies: r.HijackAnomalies, HijackRCodes: r.HijackRCodes,
+			Transparent: r.Transparent, TunnelReady: r.TunnelReady,
+			LatencyMs: r.BestLatency.Milliseconds(), Nearby: r.Nearby, Reason: r.TunnelReason,
+			Headers: r.HeaderDump(),
+		})
+	}
+	data, err := json.MarshalIndent(out, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
+func ynb(v bool) string {
+	if v {
+		return "Y"
+	}
+	return "N"
+}
+
+// ── Colour-filled XLSX report ────────────────────────────────────────────────
+//
+// CSV has no concept of cell colour, so to deliver a genuinely colour-coded
+// spreadsheet we emit a minimal (stdlib-only) OOXML .xlsx whose rows are filled
+// by resolver status: poison=purple, hijack=yellow, valid=green, invalid=red.
+// It opens in Excel/LibreOffice/Google Sheets with the fills intact.
+
+// xlsxStatusStyle maps a status to its two cellXfs style indices (left-aligned
+// for text columns, centre-aligned for flag/number columns) defined in
+// xlsxStyles. Both carry the status fill colour.
+func xlsxStatusStyle(status string) (left, center int) {
+	switch status {
+	case StatusValid:
+		return 2, 3 // green
+	case StatusPoison:
+		return 4, 5 // purple
+	case StatusHijack:
+		return 6, 7 // yellow
+	default:
+		return 8, 9 // red (invalid)
+	}
+}
+
+func xlsxCol(i int) string {
+	i++
+	var column string
+	for i > 0 {
+		i--
+		column = string(rune('A'+i%26)) + column
+		i /= 26
+	}
+	return column
+}
+
+func xlsxStr(b *bytes.Buffer, col int, row, style int, val string) {
+	fmt.Fprintf(b, `<c r="%s%d" s="%d" t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>`,
+		xlsxCol(col), row, style, html.EscapeString(val))
+}
+
+func xlsxNum(b *bytes.Buffer, col int, row, style int, n int64) {
+	fmt.Fprintf(b, `<c r="%s%d" s="%d"><v>%d</v></c>`, xlsxCol(col), row, style, n)
+}
+
+func writeXLSX(path string, results []ResolverResult) error {
+	headers := []string{
+		"IP", "Status", "Score", "RA", "AA", "TC", "RD", "RCODE", "QD", "AN",
+		"EDNS0", "TXT-pass", "UDP", "TCP",
+		"Preferred", "Fallback", "UDP poison", "TCP poison", "Disagree", "Injection",
+		"NS", "AR", "Poison", "Poison IP",
+		"Hijack", "Confidence", "Hijack path", "Checks", "Anomalies", "Hijack RCODEs", "Hijack IP", "Hijack evidence",
+		"Tunnel", "ms", "Reason",
+	}
+
+	lastRow := len(results) + 1
+	sheetRange := fmt.Sprintf("A1:%s%d", xlsxCol(len(headers)-1), lastRow)
+
+	var sheet bytes.Buffer
+	sheet.WriteString(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>`)
+	sheet.WriteString(`<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">`)
+	fmt.Fprintf(&sheet, `<dimension ref="%s"/>`, sheetRange)
+	// Freeze the header row so it stays visible while scrolling.
+	sheet.WriteString(`<sheetViews><sheetView tabSelected="1" workbookViewId="0">` +
+		`<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>` +
+		`<selection pane="bottomLeft" activeCell="A2" sqref="A2"/></sheetView></sheetViews>`)
+	sheet.WriteString(`<sheetFormatPr defaultRowHeight="15"/>`)
+	sheet.WriteString(xlsxCols)
+
+	sheet.WriteString(`<sheetData>`)
+	sheet.WriteString(`<row r="1" ht="18" customHeight="1">`)
+	for c, h := range headers {
+		xlsxStr(&sheet, c, 1, 1, h) // header style
+	}
+	sheet.WriteString(`</row>`)
+	// Columns that hold free text / addresses read best left-aligned; the compact
+	// flag and number columns read best centred.
+	leftCols := map[int]bool{
+		0: true, 1: true, 7: true, 14: true, 15: true, 23: true,
+		25: true, 26: true, 29: true, 30: true, 31: true, 34: true,
+	}
+	for i, r := range results {
+		row := i + 2
+		left, center := xlsxStatusStyle(r.Status)
+		st := func(col int) int {
+			if leftCols[col] {
+				return left
+			}
+			return center
+		}
+		fmt.Fprintf(&sheet, `<row r="%d">`, row)
+		xlsxStr(&sheet, 0, row, st(0), r.IP)
+		xlsxStr(&sheet, 1, row, st(1), strings.ToUpper(r.Status))
+		xlsxNum(&sheet, 2, row, st(2), int64(r.Score))
+		xlsxStr(&sheet, 3, row, st(3), ynb(r.RA))
+		xlsxStr(&sheet, 4, row, st(4), ynb(r.AA))
+		xlsxStr(&sheet, 5, row, st(5), ynb(r.TC))
+		xlsxStr(&sheet, 6, row, st(6), ynb(r.RD))
+		xlsxStr(&sheet, 7, row, st(7), r.RCodes)
+		xlsxNum(&sheet, 8, row, st(8), int64(r.QDCount))
+		xlsxNum(&sheet, 9, row, st(9), int64(r.ANCount))
+		xlsxStr(&sheet, 10, row, st(10), ynb(r.EDNS))
+		xlsxStr(&sheet, 11, row, st(11), ynb(r.TxtPass))
+		xlsxStr(&sheet, 12, row, st(12), ynb(r.UDPOK))
+		xlsxStr(&sheet, 13, row, st(13), ynb(r.TCPOK))
+		xlsxStr(&sheet, 14, row, st(14), r.PreferredTransport)
+		xlsxStr(&sheet, 15, row, st(15), r.FallbackTransport)
+		xlsxStr(&sheet, 16, row, st(16), ynb(r.UDPPoisoned))
+		xlsxStr(&sheet, 17, row, st(17), ynb(r.TCPPoisoned))
+		xlsxStr(&sheet, 18, row, st(18), ynb(r.TransportDisagreement))
+		xlsxStr(&sheet, 19, row, st(19), ynb(r.InjectionObserved))
+		xlsxNum(&sheet, 20, row, st(20), int64(r.NSCount))
+		xlsxNum(&sheet, 21, row, st(21), int64(r.ARCount))
+		xlsxStr(&sheet, 22, row, st(22), ynb(r.Poisoned))
+		xlsxStr(&sheet, 23, row, st(23), r.PoisonIP)
+		xlsxStr(&sheet, 24, row, st(24), ynb(r.Transparent))
+		xlsxStr(&sheet, 25, row, st(25), r.HijackConfidence)
+		hijackPath := ""
+		if r.HijackUDP {
+			hijackPath = "udp"
+		}
+		if r.HijackTCP {
+			if hijackPath != "" {
+				hijackPath += "+tcp"
+			} else {
+				hijackPath = "tcp"
+			}
+		}
+		xlsxStr(&sheet, 26, row, st(26), hijackPath)
+		xlsxNum(&sheet, 27, row, st(27), int64(r.HijackChecks))
+		xlsxNum(&sheet, 28, row, st(28), int64(r.HijackAnomalies))
+		xlsxStr(&sheet, 29, row, st(29), r.HijackRCodes)
+		xlsxStr(&sheet, 30, row, st(30), r.HijackIP)
+		xlsxStr(&sheet, 31, row, st(31), r.HijackReason)
+		xlsxStr(&sheet, 32, row, st(32), ynb(r.TunnelReady))
+		xlsxNum(&sheet, 33, row, st(33), r.BestLatency.Milliseconds())
+		xlsxStr(&sheet, 34, row, st(34), r.TunnelReason)
+		sheet.WriteString(`</row>`)
+	}
+	sheet.WriteString(`</sheetData>`)
+	fmt.Fprintf(&sheet, `<autoFilter ref="%s"/>`, sheetRange)
+	sheet.WriteString(`</worksheet>`)
+
+	parts := []struct{ name, body string }{
+		{"[Content_Types].xml", xlsxContentTypes},
+		{"_rels/.rels", xlsxRootRels},
+		{"xl/workbook.xml", xlsxWorkbook},
+		{"xl/_rels/workbook.xml.rels", xlsxWorkbookRels},
+		{"xl/styles.xml", xlsxStyles},
+		{"xl/worksheets/sheet1.xml", sheet.String()},
+	}
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for _, p := range parts {
+		w, err := zw.Create(p.name)
+		if err != nil {
+			return err
+		}
+		if _, err := w.Write([]byte(p.body)); err != nil {
+			return err
+		}
+	}
+	if err := zw.Close(); err != nil {
+		return err
+	}
+	return os.WriteFile(path, buf.Bytes(), 0o644)
+}
+
+const xlsxContentTypes = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+	`<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">` +
+	`<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>` +
+	`<Default Extension="xml" ContentType="application/xml"/>` +
+	`<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>` +
+	`<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>` +
+	`<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>` +
+	`</Types>`
+
+const xlsxRootRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+	`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+	`<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>` +
+	`</Relationships>`
+
+const xlsxWorkbook = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+	`<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">` +
+	`<sheets><sheet name="Resolvers" sheetId="1" r:id="rId1"/></sheets></workbook>`
+
+const xlsxWorkbookRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+	`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+	`<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>` +
+	`<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>` +
+	`</Relationships>`
+
+// xlsxCols sets sensible column widths so IPs, block-page addresses, and the
+// reason text are fully visible without manual resizing.
+const xlsxCols = `<cols>` +
+	`<col min="1" max="1" width="18" customWidth="1"/>` + // IP
+	`<col min="2" max="2" width="10" customWidth="1"/>` + // Status
+	`<col min="3" max="3" width="7" customWidth="1"/>` + // Score
+	`<col min="4" max="7" width="7" customWidth="1"/>` + // RA, AA, TC, RD
+	`<col min="8" max="8" width="28" customWidth="1"/>` + // per-path RCODEs
+	`<col min="9" max="10" width="6" customWidth="1"/>` + // QD, AN
+	`<col min="11" max="11" width="8" customWidth="1"/>` + // EDNS
+	`<col min="12" max="12" width="10" customWidth="1"/>` + // TXT-pass
+	`<col min="13" max="14" width="6" customWidth="1"/>` + // UDP, TCP
+	`<col min="15" max="16" width="12" customWidth="1"/>` + // preferred/fallback
+	`<col min="17" max="20" width="11" customWidth="1"/>` + // transport integrity
+	`<col min="21" max="22" width="5" customWidth="1"/>` + // NS, AR
+	`<col min="23" max="23" width="8" customWidth="1"/>` + // Poison
+	`<col min="24" max="24" width="22" customWidth="1"/>` + // Poison IP
+	`<col min="25" max="25" width="8" customWidth="1"/>` + // Hijack
+	`<col min="26" max="27" width="13" customWidth="1"/>` + // confidence/path
+	`<col min="28" max="29" width="10" customWidth="1"/>` + // checks/anomalies
+	`<col min="30" max="30" width="28" customWidth="1"/>` + // Hijack RCODE evidence
+	`<col min="31" max="31" width="22" customWidth="1"/>` + // Hijack IP
+	`<col min="32" max="32" width="42" customWidth="1"/>` + // Hijack evidence
+	`<col min="33" max="33" width="8" customWidth="1"/>` + // Tunnel
+	`<col min="34" max="34" width="7" customWidth="1"/>` + // ms
+	`<col min="35" max="35" width="46" customWidth="1"/>` + // Reason
+	`</cols>`
+
+// xlsxStyles defines fonts, the four status fills + header fill, and the cellXfs
+// referenced by cells: 0 default, 1 header (bold/centred), then per status a
+// left-aligned and a centre-aligned variant — green 2/3, purple 4/5, yellow 6/7,
+// red 8/9.
+const xlsxStyles = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+	`<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">` +
+	`<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font>` +
+	`<font><b/><color rgb="FFFFFFFF"/><sz val="11"/><name val="Calibri"/></font></fonts>` +
+	`<fills count="7">` +
+	`<fill><patternFill patternType="none"/></fill>` +
+	`<fill><patternFill patternType="gray125"/></fill>` +
+	`<fill><patternFill patternType="solid"><fgColor rgb="FF333333"/></patternFill></fill>` +
+	`<fill><patternFill patternType="solid"><fgColor rgb="FFA5D6A7"/></patternFill></fill>` +
+	`<fill><patternFill patternType="solid"><fgColor rgb="FFB39DDB"/></patternFill></fill>` +
+	`<fill><patternFill patternType="solid"><fgColor rgb="FFFFF59D"/></patternFill></fill>` +
+	`<fill><patternFill patternType="solid"><fgColor rgb="FFEF9A9A"/></patternFill></fill>` +
+	`</fills>` +
+	`<borders count="1"><border/></borders>` +
+	`<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>` +
+	`<cellXfs count="10">` +
+	`<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>` +
+	`<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>` +
+	`<xf numFmtId="0" fontId="0" fillId="3" borderId="0" xfId="0" applyFill="1" applyAlignment="1"><alignment horizontal="left" vertical="center"/></xf>` +
+	`<xf numFmtId="0" fontId="0" fillId="3" borderId="0" xfId="0" applyFill="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>` +
+	`<xf numFmtId="0" fontId="0" fillId="4" borderId="0" xfId="0" applyFill="1" applyAlignment="1"><alignment horizontal="left" vertical="center"/></xf>` +
+	`<xf numFmtId="0" fontId="0" fillId="4" borderId="0" xfId="0" applyFill="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>` +
+	`<xf numFmtId="0" fontId="0" fillId="5" borderId="0" xfId="0" applyFill="1" applyAlignment="1"><alignment horizontal="left" vertical="center"/></xf>` +
+	`<xf numFmtId="0" fontId="0" fillId="5" borderId="0" xfId="0" applyFill="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>` +
+	`<xf numFmtId="0" fontId="0" fillId="6" borderId="0" xfId="0" applyFill="1" applyAlignment="1"><alignment horizontal="left" vertical="center"/></xf>` +
+	`<xf numFmtId="0" fontId="0" fillId="6" borderId="0" xfId="0" applyFill="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>` +
+	`</cellXfs></styleSheet>`

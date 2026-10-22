@@ -1,0 +1,10 @@
+# Manual resolver list. One IP or IP:port per line.
+# Lines starting with # are ignored. Use this file with:
+#   soar-client run -config /etc/soar-client/client.json \
+#     -mode manual -resolvers /etc/soar-client/resolvers.txt
+
+1.1.1.1
+8.8.8.8
+9.9.9.9
+217.218.155.155
+178.252.143.133
