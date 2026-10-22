@@ -22,7 +22,7 @@ import (
 	"github.com/getlantern/soar"
 )
 
-var clientVersion = "1.2.0"
+var clientVersion = "1.2.1"
 
 const engineVersion = "1.6.7"
 
@@ -201,6 +201,8 @@ func dispatch(ctx context.Context, args []string) error {
 		return runScanCommand(ctx, args[1:])
 	case "run", "client", "connect":
 		return runClient(ctx, args[1:])
+	case "auth", "set-auth":
+		return runAuth(args[1:])
 	case "version", "-version", "--version":
 		printVersion()
 		return nil
@@ -222,6 +224,7 @@ func usage() {
 	fmt.Print(`Soar Client - authenticated DNS tunnel SOCKS5 proxy with a resolver scanner
 
 Usage:
+  soar-client auth
   soar-client run  -config client.json -resolvers resolvers.txt
   soar-client run  -config client.json -scan -candidates candidates.txt
   soar-client scan -candidates candidates.txt -out-list resolvers-valid.txt
@@ -231,6 +234,15 @@ Modes:
   manual   use the resolver list you provide (default when -resolvers is set)
   auto     scan candidates, verify the survivors, then start the client
   scan     scan only and write reports / a resolver list
+
+Credentials (easiest):
+  soar-client auth    interactively set the SOCKS username/password in
+                      /etc/soar-client/client.json
+    -config FILE      JSON config to update (default /etc/soar-client/client.json)
+    -username USER    non-interactive username
+    -password PASS    non-interactive password (visible in shell history)
+    -listen ADDR      also change the SOCKS listen address
+    -restart          restart soar-client.service after updating
 
 Client flags:
   -config FILE        client JSON configuration (required for manual/auto)
@@ -252,8 +264,8 @@ Listener / credential overrides (config file < environment < flags):
   SOAR_LISTEN         SOCKS listen address, e.g. 0.0.0.0:10886
   SOAR_USERNAME       SOCKS username (empty clears it)
   SOAR_PASSWORD       SOCKS password (empty clears it)
-  -username/-password are visible in the process list; prefer the config file
-  or the SOAR_* environment variables for production.
+  -username/-password are visible in the process list; prefer the auth command
+  or client.json for production.
 
 Scanner flags:
   -candidates FILE    IPs and/or CIDR ranges (default: bundled candidates)

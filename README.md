@@ -15,8 +15,9 @@ resolvers that actually carry a tunnel, and start with that list.
 > The old repository only contained the standalone scanner; this repository is
 > the combined client + scanner.
 
-> **Status:** client `1.2.0` adds listener/credential environment overrides and
-> a per-instance systemd template for multiple SOCKS endpoints. The tunnel and
+> **Status:** client `1.2.1` adds the simple `soar-client auth` command for
+> changing SOCKS credentials. It also keeps the listener/credential environment
+> overrides and per-instance systemd template from `1.2.0`. The tunnel and
 > scanner paths were validated on 2026-10-22 on AlmaLinux 8.10 against a live
 > Soar `0.5.0` server; manual and auto modes authenticated and carried real
 > HTTPS traffic through the tunnel.
@@ -61,7 +62,7 @@ bundled country/global fallback.
 Go 1.25 or newer is required.
 
 ```bash
-./build.sh 1.2.0
+./build.sh 1.2.1
 ```
 
 Output:
@@ -80,8 +81,8 @@ sudo bash install.sh
 or, from a release tarball:
 
 ```bash
-tar -xzf soar-client-1.2.0-linux-amd64.tar.gz
-cd soar-client-1.2.0-linux-amd64
+tar -xzf soar-client-1.2.1-linux-amd64.tar.gz
+cd soar-client-1.2.1-linux-amd64
 sudo bash install.sh
 ```
 
@@ -117,80 +118,118 @@ SOAR_READY authenticated=1 https=1
 
 The SOCKS proxy is `127.0.0.1:10886` by default.
 
-To expose it to other hosts, set `listen` to `0.0.0.0:10886` (or a specific
-interface IP) and set non-empty `username` and `password` in
-`/etc/soar-client/client.json`:
-
-```json
-{
-  "listen": "0.0.0.0:10886",
-  "username": "soar",
-  "password": "use-a-long-random-password"
-}
-```
-
-A non-loopback listener without authentication is rejected. Restart the
-service after changing the file:
+To expose it to other hosts, run the interactive credential command once. It
+sets the listener and the required username/password together:
 
 ```bash
-systemctl restart soar-client
+sudo soar-client auth -listen 0.0.0.0:10886
 ```
+
+It prompts for a username and a hidden password, writes
+`/etc/soar-client/client.json`, and tells you to restart. A non-loopback
+listener without authentication is rejected, so the command refuses to write an
+invalid result.
 
 SOCKS5 username/password is not encrypted on the client-to-listener hop. If the
 port is reachable over an untrusted network, restrict it with a firewall
 allow-list, a VPN, or an SSH tunnel.
 
-### 3. Change the SOCKS port, username, or password
+### 3. Change the SOCKS username/password
 
-The values in `client.json` are defaults. You can override the listener and
-credentials without duplicating the tunnel configuration. Precedence is:
+Use the `auth` command. It is the easiest and safest method:
 
+```bash
+sudo soar-client auth
 ```
-client.json  <  SOAR_* environment  <  command-line flags
+
+It asks for:
+
+```text
+SOCKS username: ali
+SOCKS password (hidden):
 ```
 
-| Override | Environment | Flag |
+Then it writes the values to `/etc/soar-client/client.json`, preserves the
+tunnel settings (`zone`, public key, resolver options), validates the result,
+and prints the restart command:
+
+```bash
+sudo systemctl restart soar-client
+```
+
+To restart automatically after the update:
+
+```bash
+sudo soar-client auth -restart
+```
+
+To change the port as well:
+
+```bash
+sudo soar-client auth -listen 0.0.0.0:10887
+```
+
+For scripting, the values can be passed as flags. This is convenient but the
+password may remain in your shell history, so interactive mode is preferred:
+
+```bash
+sudo soar-client auth -username ali -password 'use-a-long-random-password'
+```
+
+What `auth` does:
+
+- writes only `username`, `password`, and optionally `listen`;
+- keeps the rest of `client.json` unchanged;
+- validates the new file before replacing the old one;
+- preserves the file's owner and permissions;
+- warns if `/etc/soar-client/mode.env` still contains `SOAR_USERNAME`,
+  `SOAR_PASSWORD`, or a relevant `SOAR_LISTEN`, because those override the JSON
+  file.
+
+If you prefer to edit the file manually, change only the `username` and
+`password` values inside the existing `/etc/soar-client/client.json`. Keep the
+`zone` and `server_public_key` keys; do not replace the whole file with this
+snippet:
+
+```json
+{
+  "username": "ali",
+  "password": "use-a-long-random-password"
+}
+```
+
+Then restart:
+
+```bash
+sudo systemctl restart soar-client
+```
+
+#### Main service vs. instances
+
+Use one file per service, so there is no ambiguity:
+
+| What you run | Where the credentials live | How to change them |
 |---|---|---|
-| Listen address | `SOAR_LISTEN` | `-listen` |
-| SOCKS username | `SOAR_USERNAME` | `-username` |
-| SOCKS password | `SOAR_PASSWORD` | `-password` |
+| `soar-client.service` (main) | `/etc/soar-client/client.json` | `sudo soar-client auth` |
+| `soar-client@1.service` | `/etc/soar-client/instances/1.env` | edit `SOAR_USERNAME` / `SOAR_PASSWORD`, then `sudo systemctl restart soar-client@1` |
+| `soar-client@2.service` | `/etc/soar-client/instances/2.env` | same as above with `2` |
 
-Example with environment variables:
-
-```bash
-SOAR_LISTEN=0.0.0.0:10887 \
-SOAR_USERNAME=soar2 \
-SOAR_PASSWORD='use-a-long-random-password' \
-soar-client run -config /etc/soar-client/client.json \
-  -mode manual -resolvers /etc/soar-client/resolvers.txt
-```
-
-For the main systemd service, put the same assignments in
-`/etc/soar-client/mode.env`, then restart:
+For an instance, the three-line env file is the source of truth:
 
 ```bash
-# /etc/soar-client/mode.env
 SOAR_LISTEN=0.0.0.0:10887
 SOAR_USERNAME=soar2
 SOAR_PASSWORD=use-a-long-random-password
 ```
 
-```bash
-systemctl restart soar-client
-```
-
-The flag form is convenient for a one-off test:
+After editing it:
 
 ```bash
-soar-client run -config /etc/soar-client/client.json \
-  -mode manual -resolvers /etc/soar-client/resolvers.txt \
-  -listen 0.0.0.0:10887 -username soar2 -password 'use-a-long-random-password'
+sudo systemctl restart soar-client@2
 ```
 
-> `-password` and `-username` appear in the process list. Prefer the config file
-> or `SOAR_*` environment variables for a long-running service. Setting
-> `SOAR_USERNAME=` and `SOAR_PASSWORD=` to empty clears the credentials; a
-> non-loopback listener will then be rejected by validation.
+Do not put the same credentials in both `client.json` and `mode.env`. If you
+need the advanced environment override, use one place only.
 
 ### 4. Run multiple SOCKS endpoints
 
@@ -390,9 +429,9 @@ point this at a zone you control.
 | `-mode MODE` | inferred | `manual`, `auto`, `scan` |
 | `-scan` | off | shorthand for `-mode auto` |
 | `-scan-only` | off | shorthand for `-mode scan` |
-| `-listen ADDR` | from config | override the SOCKS listener (public binds need auth) |
-| `-username USER` | from config | override the SOCKS username (visible in `ps`) |
-| `-password PASS` | from config | override the SOCKS password (visible in `ps`) |
+| `-listen ADDR` | from config | temporary listener override (public binds need auth) |
+| `-username USER` | from config | temporary username override (prefer `soar-client auth`) |
+| `-password PASS` | from config | temporary password override (visible in `ps`) |
 | `-discovery on\|off` | off in manual/auto | add bundled Soar discovery fallback |
 | `-verify` | `auto` | `auto` = on for auto/scan, off for manual; or `on` / `off` |
 | `-verify-workers N` | `2` | concurrent verification probes |
@@ -404,6 +443,37 @@ The legacy form still works:
 ```bash
 soar-client -config client.json -resolvers resolvers.txt
 ```
+
+### `auth` flags
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `-config FILE` | `/etc/soar-client/client.json` | JSON file to update |
+| `-username USER` | prompt | non-interactive username |
+| `-password PASS` | prompt | non-interactive password (shell history risk) |
+| `-listen ADDR` | unchanged | also change the listener |
+| `-restart` | off | restart `soar-client.service` after writing |
+
+## Advanced: environment and flag overrides
+
+Normal use does not need this section. Use `soar-client auth` for the main
+service and the per-instance env file for `soar-client@N.service`.
+
+For temporary tests, the listener and credentials can be overridden with
+environment variables or flags:
+
+| Override | Environment | Flag |
+|---|---|---|
+| Listen address | `SOAR_LISTEN` | `-listen` |
+| SOCKS username | `SOAR_USERNAME` | `-username` |
+| SOCKS password | `SOAR_PASSWORD` | `-password` |
+
+Precedence is `client.json` < environment < flags. The flags are visible in the
+process list; do not use them for a long-running service. If
+`/etc/soar-client/mode.env` contains `SOAR_USERNAME`, `SOAR_PASSWORD`, or
+`SOAR_LISTEN`, those values override `client.json`; that is why the `auth`
+command warns about them. Pick one place for the main service: preferably
+`client.json`.
 
 ## Soar vs CottenDNS
 
@@ -418,7 +488,7 @@ The panel can show two share profiles for the same panel account: **Soar** and
 This binary is Soar-only. It imports `github.com/getlantern/soar`, reads
 `zone`, `server_public_key`, and the `soar` options, and has no CottenDNS code.
 A CottenDNS profile cannot be loaded with `-config`, and there is no
-`-engine cotten` switch in `1.2.0`.
+`-engine cotten` switch in `1.2.1`.
 
 If the panel account is set to **Soar + Cotten**, both profiles are valid on
 the server. To use CottenDNS from Iran, run the official
@@ -431,13 +501,13 @@ encryption key, so its profile is not interchangeable with the Soar
 Adding a native CottenDNS mode to this binary would mean vendoring or embedding
 the CottenDNS engine and merging its configuration/listener model. That is a
 separate engine integration, not a configuration toggle; it is not part of
-`1.2.0`.
+`1.2.1`.
 
 ## systemd mode selection
 
 The unit starts `/usr/local/bin/soar-client-run`, which sources
-`/etc/soar-client/mode.env` and exports its variables. To switch modes or
-override the listener/credentials, edit that file and restart:
+`/etc/soar-client/mode.env`. To switch modes, edit that file and restart. Do not
+put credentials here; use `soar-client auth` instead:
 
 ```bash
 # manual
@@ -492,7 +562,8 @@ line and is what manual mode and the service consume.
 - Per-instance files under `/etc/soar-client/instances/` contain passwords; use
   mode `0600` and `root:root` ownership. The systemd template reads them as
   root, so the service user does not need read access.
-- Environment overrides (`SOAR_PASSWORD`, etc.) are safer than command-line
+- Interactive `soar-client auth` avoids putting the password in shell history
+  and hides it while typing. Environment overrides are safer than command-line
   flags, but any user who can read the service environment or the env file can
   read the password. Restrict both.
 - Scan reports can reveal network topology; keep `/var/lib/soar-client` private.
@@ -513,7 +584,7 @@ line and is what manual mode and the service consume.
 
 ```bash
 go test ./...
-./build.sh 1.2.0
+./build.sh 1.2.1
 ```
 
 The test suite covers the Soar config bounds, SOCKS negotiation, hostname
@@ -532,7 +603,7 @@ clones keep working. If an existing clone still uses the old URL, update it:
 git remote set-url origin https://github.com/alimc98/Soar-Client.git
 ```
 
-Release tag: `soar-client-v1.2.0`.
+Release tag: `soar-client-v1.2.1`.
 
 ## Credits
 
@@ -592,26 +663,74 @@ systemctl restart soar-client
 
 ### تغییر پورت، یوزر و پسورد
 
-مقادیر داخل `client.json` پیش‌فرض هستند و می‌توان بدون دست‌زدن به بقیهٔ کانفیگ
-آن‌ها را override کرد. اولویت این است:
-
-```
-client.json  <  متغیرهای SOAR_*  <  فلگ‌های خط فرمان
-```
+ساده‌ترین راه، دستور `auth` است. فقط اجرا کنید و Username و Password را وارد
+کنید:
 
 ```bash
-SOAR_LISTEN=0.0.0.0:10887 \
-SOAR_USERNAME=soar2 \
-SOAR_PASSWORD='یک-رمز-تصادفی-طولانی' \
-soar-client run -config /etc/soar-client/client.json \
-  -mode manual -resolvers /etc/soar-client/resolvers.txt
+sudo soar-client auth
 ```
 
-برای سرویس اصلی، همین سه متغیر را در `/etc/soar-client/mode.env` بگذارید و
-`systemctl restart soar-client` بزنید. فلگ‌های `-listen`، `-username` و
-`-password` هم هستند، ولی پسورد در `ps` دیده می‌شود؛ برای سرویس دائمی از
-فایل یا env استفاده کنید. با خالی‌کردن `SOAR_USERNAME` و `SOAR_PASSWORD`
-احراز هویت پاک می‌شود و یک listener عمومی دیگر معتبر نیست.
+```text
+SOCKS username: ali
+SOCKS password (hidden):
+```
+
+مقادیر داخل `/etc/soar-client/client.json` ذخیره می‌شوند، بقیهٔ تنظیمات تونل
+دست‌نخورده می‌مانند و فایل قبل از جایگزینی validate می‌شود. بعد فقط سرویس را
+restart کنید:
+
+```bash
+sudo systemctl restart soar-client
+```
+
+اگر بخواهید خودش restart کند:
+
+```bash
+sudo soar-client auth -restart
+```
+
+اگر بخواهید پورت را هم عوض کنید:
+
+```bash
+sudo soar-client auth -listen 0.0.0.0:10887
+```
+
+برای اسکریپت هم می‌توانید مقدارها را مستقیم بدهید؛ ولی پسورد در history می‌ماند،
+پس حالت تعاملی بهتر است:
+
+```bash
+sudo soar-client auth -username ali -password 'یک-رمز-تصادفی-طولانی'
+```
+
+`auth` فقط `username`، `password` و در صورت نیاز `listen` را عوض می‌کند؛
+`zone`، public key و تنظیمات resolver را نگه می‌دارد. اگر
+`/etc/soar-client/mode.env` هم `SOAR_USERNAME`، `SOAR_PASSWORD` یا `SOAR_LISTEN`
+داشته باشد، هشدار می‌دهد؛ چون آن‌ها بر `client.json` اولویت دارند.
+
+برای instanceها، فایل env همان instance منبع اصلی است:
+
+| سرویس | فایل اعتبارنامه | نحوهٔ تغییر |
+|---|---|---|
+| `soar-client.service` (اصلی) | `/etc/soar-client/client.json` | `sudo soar-client auth` |
+| `soar-client@1.service` | `/etc/soar-client/instances/1.env` | `SOAR_USERNAME` و `SOAR_PASSWORD` را ویرایش کنید، سپس `systemctl restart soar-client@1` |
+| `soar-client@2.service` | `/etc/soar-client/instances/2.env` | مثل مورد قبل با شمارهٔ `2` |
+
+نمونهٔ فایل instance:
+
+```bash
+SOAR_LISTEN=0.0.0.0:10887
+SOAR_USERNAME=soar2
+SOAR_PASSWORD=یک-رمز-تصادفی-طولانی
+```
+
+بعد:
+
+```bash
+sudo systemctl restart soar-client@2
+```
+
+اعتبارنامه را هم در `client.json` و هم در `mode.env` نگذارید؛ برای سرویس اصلی
+فقط `client.json` (یا دستور `auth`) و برای instance فقط فایل همان instance.
 
 ### چند کلاینت و پنج پورت SOCKS
 
@@ -668,7 +787,7 @@ WireGuard/SSH tunnel بهتر از بازکردن پنج پورت عمومی ا�
 اکانت پنل می‌تواند هم پروفایل Soar و هم CottenDNS بدهد؛ این دو موتور جدا هستند،
 نه دو حالت همین باینری. کلاینت فعلی فقط Soar را می‌فهمد (`getlantern/soar`،
 `zone`/`server_public_key`/`soar`). پروفایل CottenDNS با `-config` این برنامه
-کار نمی‌کند و در `1.2.0` سوییچ `-engine cotten` وجود ندارد.
+کار نمی‌کند و در `1.2.1` سوییچ `-engine cotten` وجود ندارد.
 
 اگر اکانت پنل روی «Soar + Cotten» است، سمت سرور هر دو آماده است. برای استفاده از
 CottenDNS در ایران، کلاینت رسمی CottenDNS را روی یک پورت SOCKS دیگر اجرا کنید و

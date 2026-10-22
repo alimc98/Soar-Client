@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.2.1 - 2026-10-22
+
+- Add `soar-client auth` for changing the SOCKS username/password. It prompts
+  for credentials, hides the password, preserves tunnel settings, validates the
+  result, and updates `client.json` atomically.
+- Add `-listen` and `-restart` options to the auth command.
+- Warn when `mode.env` contains credential overrides that would make a
+  `client.json` change appear to have no effect.
+- Simplify the README: `client.json`/`auth` for the main service, per-instance
+  env files for instances; environment/flags are now an advanced section.
+- Remove credential examples from `mode.env.example` to avoid ambiguity.
+
 ## 1.2.0 - 2026-10-22
 
 - Add `-username` and `-password` listener overrides.

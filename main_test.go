@@ -311,6 +311,64 @@ func TestLoadConfigDefersListenerValidation(t *testing.T) {
 	}
 }
 
+func TestUpdateAuthConfigPreservesTunnelSettings(t *testing.T) {
+	cfg := defaults()
+	cfg.Zone = "t.example.com"
+	cfg.PublicKey = base64.StdEncoding.EncodeToString(make([]byte, 32))
+	cfg.Listen = "0.0.0.0:10998"
+	cfg.SystemResolvers = []string{"1.1.1.1"}
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "client.json")
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadConfigValidated(path); err == nil {
+		t.Fatal("public listener without credentials was accepted before the update")
+	}
+	if err := updateAuthConfig(path, "new-user", "new-pass", "0.0.0.0:10997"); err != nil {
+		t.Fatalf("updateAuthConfig: %v", err)
+	}
+	updated, err := loadConfigValidated(path)
+	if err != nil {
+		t.Fatalf("updated config is invalid: %v", err)
+	}
+	if updated.Zone != cfg.Zone || updated.PublicKey != cfg.PublicKey || updated.Soar != cfg.Soar {
+		t.Fatal("tunnel settings changed while updating credentials")
+	}
+	if updated.Listen != "0.0.0.0:10997" || updated.Username != "new-user" || updated.Password != "new-pass" {
+		t.Fatalf("unexpected updated values: listen=%q user=%q", updated.Listen, updated.Username)
+	}
+}
+
+func TestUpdateAuthConfigRefusesInvalidResult(t *testing.T) {
+	cfg := defaults()
+	cfg.Zone = "t.example.com"
+	cfg.PublicKey = base64.StdEncoding.EncodeToString(make([]byte, 32))
+	cfg.Username = "old-user"
+	cfg.Password = "old-pass"
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "client.json")
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := updateAuthConfig(path, "new-user", "new-pass", "not-an-address"); err == nil {
+		t.Fatal("invalid listener was accepted")
+	}
+	unchanged, err := loadConfigValidated(path)
+	if err != nil {
+		t.Fatalf("original config was damaged: %v", err)
+	}
+	if unchanged.Username != "old-user" || unchanged.Password != "old-pass" {
+		t.Fatal("original credentials were changed despite the rejected update")
+	}
+}
+
 func TestResolversAreNormalizedAndDeduplicated(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "resolvers")
 	_ = os.WriteFile(file, []byte("# test\n1.1.1.1\n1.1.1.1:53\n[::1]:5353\n"), 0600)

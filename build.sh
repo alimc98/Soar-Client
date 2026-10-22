@@ -9,7 +9,7 @@ set -euo pipefail
 
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 
-VERSION="${1:-1.2.0}"
+VERSION="${1:-1.2.1}"
 
 command -v go >/dev/null 2>&1 || {
   echo "error: Go 1.25 or newer is required" >&2
