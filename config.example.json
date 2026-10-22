@@ -2,6 +2,8 @@
   "zone": "your-zone.u.example.com",
   "server_public_key": "BASE64_32_BYTE_ED25519_PUBLIC_KEY=",
   "listen": "127.0.0.1:10886",
+  "username": "",
+  "password": "",
   "system_resolvers": ["1.1.1.1", "8.8.8.8", "9.9.9.9"],
   "soar": {
     "transport": "auto",

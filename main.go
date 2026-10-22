@@ -22,7 +22,7 @@ import (
 	"github.com/getlantern/soar"
 )
 
-var clientVersion = "1.0.0"
+var clientVersion = "1.1.0"
 
 const engineVersion = "1.6.7"
 
@@ -74,16 +74,12 @@ func (c config) validate() error {
 			return errors.New("network DNS server must be an IP address")
 		}
 	}
-	ip, port, err := net.SplitHostPort(c.Listen)
-	if err != nil {
-		return errors.New("listen must be a loopback IP:port")
+	ap, err := netip.ParseAddrPort(c.Listen)
+	if err != nil || ap.Port() == 0 {
+		return errors.New("listen must be an IP:port with a port between 1 and 65535")
 	}
-	a, err := netip.ParseAddr(ip)
-	if err != nil || !a.IsLoopback() || port == "" {
-		return errors.New("SOCKS listener must use loopback, for example 127.0.0.1:10886")
-	}
-	if ap, err := netip.ParseAddrPort(c.Listen); err != nil || ap.Port() == 0 {
-		return errors.New("listen port must be between 1 and 65535")
+	if !ap.Addr().IsLoopback() && c.Username == "" {
+		return errors.New("listen on a non-loopback address requires SOCKS username and password")
 	}
 	if c.Zone != strings.ToLower(c.Zone) || len(c.Zone) > 45 || !strings.Contains(c.Zone, ".") {
 		return errors.New("use one lowercase ASCII tunnel domain, maximum 45 characters")
@@ -215,7 +211,7 @@ Client flags:
   -mode MODE          manual | auto | scan (inferred when omitted)
   -scan               shorthand for -mode auto
   -scan-only          shorthand for -mode scan
-  -listen ADDR        override the loopback SOCKS listen address
+  -listen ADDR        override the SOCKS listen address (public binds need auth)
   -discovery on|off   override Soar discovery (default: off in manual/auto)
   -verify auto|on|off  verify survivors with a real Soar handshake
                       (default auto: on for auto/scan, off for manual)
@@ -473,6 +469,7 @@ func serveClient(ctx context.Context, cfg config, resolvers []string, mode strin
 	if err != nil {
 		return errors.New("local SOCKS port is unavailable; stop the other connection or choose another proxy port")
 	}
+	fmt.Printf("SOAR_LISTEN listen=%s auth=%t\n", listener.Addr().String(), cfg.Username != "")
 	fmt.Println("SOAR_READY authenticated=1 https=1")
 	fmt.Println("WD_PROGRESS phase=connected percent=100")
 	return p.serve(ctx, listener)

@@ -209,7 +209,7 @@ func TestStartupChecksHTTPSCertificate(t *testing.T) {
 	}
 }
 
-func TestConfigBoundsAndNoNetworkListener(t *testing.T) {
+func TestConfigBoundsAndPublicListenerAuth(t *testing.T) {
 	cfg := defaults()
 	cfg.Zone = "t.example.com"
 	cfg.PublicKey = base64.StdEncoding.EncodeToString(make([]byte, 32))
@@ -218,9 +218,22 @@ func TestConfigBoundsAndNoNetworkListener(t *testing.T) {
 	}
 	cfg.Listen = "0.0.0.0:1080"
 	if cfg.validate() == nil {
-		t.Fatal("network-exposed SOCKS was allowed")
+		t.Fatal("public SOCKS listener without authentication was allowed")
+	}
+	cfg.Username, cfg.Password = "user", "pass"
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("authenticated public listener was rejected: %v", err)
+	}
+	cfg.Listen = "[::]:1080"
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("authenticated IPv6 wildcard listener was rejected: %v", err)
+	}
+	cfg.Listen = "0.0.0.0:0"
+	if cfg.validate() == nil {
+		t.Fatal("port zero was accepted")
 	}
 	cfg.Listen = "127.0.0.1:1080"
+	cfg.Username, cfg.Password = "", ""
 	cfg.Soar.SessionIdleSeconds = 120
 	if cfg.validate() == nil {
 		t.Fatal("idle timeout exceeds server expiry")

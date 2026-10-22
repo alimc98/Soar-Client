@@ -3,6 +3,7 @@ Description=Soar Client - authenticated DNS tunnel SOCKS5 proxy
 Documentation=https://github.com/alimc98/Soar-Client
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple

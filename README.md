@@ -4,19 +4,21 @@ A Linux client for the WhiteDNS Soar DNS tunnel, built from the `Soar/` engine
 in [WhiteDNS/WhiteDNS-Desktop](https://github.com/WhiteDNS/WhiteDNS-Desktop),
 with the WhiteDNS resolver scanner integrated into the same binary.
 
-The client exposes a **loopback SOCKS5 `CONNECT`** proxy. TCP traffic sent to
-the proxy travels through an authenticated DNS tunnel to the Soar server. A
-resolver can be supplied manually, or the client can scan candidate IPs/CIDRs,
-keep the resolvers that actually carry a tunnel, and start with that list.
+The client exposes a **SOCKS5 `CONNECT`** proxy. It listens on loopback by
+default; a public listener such as `0.0.0.0:10886` is allowed only when SOCKS5
+username/password authentication is configured. TCP traffic sent to the proxy
+travels through an authenticated DNS tunnel to the Soar server. A resolver can
+be supplied manually, or the client can scan candidate IPs/CIDRs, keep the
+resolvers that actually carry a tunnel, and start with that list.
 
 > This project was renamed from `whitedns-resolver-scan` to `Soar-Client`.
 > The old repository only contained the standalone scanner; this repository is
 > the combined client + scanner.
 
-> **Status:** client `1.0.0` was tested on 2026-10-22 on AlmaLinux 8.10 against
-> a live Soar `0.5.0` server. Manual and auto modes authenticated and carried
-> real HTTPS traffic through the tunnel; scan-only and scan+verify paths were
-> tested as well.
+> **Status:** client `1.1.0` adds authenticated public SOCKS listeners. The
+> tunnel and scanner paths were validated on 2026-10-22 on AlmaLinux 8.10
+> against a live Soar `0.5.0` server; manual and auto modes authenticated and
+> carried real HTTPS traffic through the tunnel.
 
 ## What is inside
 
@@ -110,6 +112,29 @@ SOAR_READY authenticated=1 https=1
 ```
 
 The SOCKS proxy is `127.0.0.1:10886` by default.
+
+To expose it to other hosts, set `listen` to `0.0.0.0:10886` (or a specific
+interface IP) and set non-empty `username` and `password` in
+`/etc/soar-client/client.json`:
+
+```json
+{
+  "listen": "0.0.0.0:10886",
+  "username": "soar",
+  "password": "use-a-long-random-password"
+}
+```
+
+A non-loopback listener without authentication is rejected. Restart the
+service after changing the file:
+
+```bash
+systemctl restart soar-client
+```
+
+SOCKS5 username/password is not encrypted on the client-to-listener hop. If the
+port is reachable over an untrusted network, restrict it with a firewall
+allow-list, a VPN, or an SSH tunnel.
 
 ### 3. Manual mode
 
@@ -219,7 +244,7 @@ point this at a zone you control.
 | `-mode MODE` | inferred | `manual`, `auto`, `scan` |
 | `-scan` | off | shorthand for `-mode auto` |
 | `-scan-only` | off | shorthand for `-mode scan` |
-| `-listen ADDR` | from config | override the loopback SOCKS listener |
+| `-listen ADDR` | from config | override the SOCKS listener (public binds need auth) |
 | `-discovery on\|off` | off in manual/auto | add bundled Soar discovery fallback |
 | `-verify` | `auto` | `auto` = on for auto/scan, off for manual; or `on` / `off` |
 | `-verify-workers N` | `2` | concurrent verification probes |
@@ -274,7 +299,13 @@ line and is what manual mode and the service consume.
 
 ## Security notes
 
-- The SOCKS listener **must** be loopback. `0.0.0.0` is rejected.
+- The SOCKS listener is loopback by default. A non-loopback bind (for example
+  `0.0.0.0:10886`) is accepted only when `username` and `password` are set in
+  `client.json`; unauthenticated public listeners are rejected.
+- SOCKS5 username/password is not encrypted on the client-to-listener hop. Use
+  a firewall allow-list, a VPN, or an SSH tunnel when the listener is reachable
+  over an untrusted network. Do not expose it to the whole Internet without
+  additional protection.
 - Only TCP `CONNECT` is supported. `BIND` and `UDP ASSOCIATE` are rejected.
 - The tunnel carries TCP only; do not route UDP/QUIC through it.
 - The Soar server controls the destination allow-list (for example ports 80 and
@@ -318,7 +349,7 @@ clones keep working. If an existing clone still uses the old URL, update it:
 git remote set-url origin https://github.com/alimc98/Soar-Client.git
 ```
 
-Release tag: `soar-client-v1.0.0`.
+Release tag: `soar-client-v1.1.0`.
 
 ## Credits
 
@@ -364,6 +395,14 @@ soar-client scan -candidates /etc/soar-client/candidates.txt \
   -out-list /var/lib/soar-client/resolvers-valid.txt
 ```
 
-خروجی SOCKS روی `127.0.0.1:10886` است و فقط TCP `CONNECT` را پشتیبانی می‌کند.
-برای سرویس systemd فایل `/etc/soar-client/mode.env` را ویرایش کنید و بعد
-`systemctl restart soar-client` بزنید.
+خروجی SOCKS به‌صورت پیش‌فرض روی `127.0.0.1:10886` است و فقط TCP `CONNECT` را
+پشتیبانی می‌کند. برای دسترسی از بیرون، در `/etc/soar-client/client.json` مقدار
+`listen` را مثلاً `0.0.0.0:10886` بگذارید و حتماً `username` و `password` را
+تنظیم کنید؛ bind روی آدرس non-loopback بدون احراز هویت رد می‌شود. پورت را در
+فایروال فقط برای منابع مجاز باز کنید. بعد از تغییر، سرویس را restart کنید:
+
+```bash
+systemctl restart soar-client
+```
+
+برای انتخاب حالت manual/auto، فایل `/etc/soar-client/mode.env` را ویرایش کنید.

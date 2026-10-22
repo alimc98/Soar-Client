@@ -9,7 +9,7 @@ set -euo pipefail
 
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 
-VERSION="${1:-1.0.0}"
+VERSION="${1:-1.1.0}"
 
 for arch in amd64 arm64; do
   BIN="dist/soar-client-linux-$arch"
