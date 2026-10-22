@@ -307,22 +307,18 @@ preservation, HTTPS certificate validation, resolver planning, CIDR expansion,
 and candidate parsing. The scanner package is built from the upstream engine;
 see `THIRD_PARTY.md` for provenance.
 
-## Repository rename
+## Repository
 
-The local Git remote still points at the old name. To finish the rename on
-GitHub:
-
-1. Open `https://github.com/alimc98/whitedns-resolver-scan/settings`.
-2. Rename the repository to `Soar-Client`.
-3. Update the remote and push:
+The project is published at
+[`alimc98/Soar-Client`](https://github.com/alimc98/Soar-Client). It was renamed
+from `alimc98/whitedns-resolver-scan`; GitHub redirects the old URL, so old
+clones keep working. If an existing clone still uses the old URL, update it:
 
 ```bash
 git remote set-url origin https://github.com/alimc98/Soar-Client.git
-git push -u origin main
 ```
 
-GitHub keeps redirects from the old URL for a while, so existing clones keep
-working.
+Release tag: `soar-client-v1.0.0`.
 
 ## Credits
 
